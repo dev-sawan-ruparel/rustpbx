@@ -2218,7 +2218,7 @@ mod tests {
             .read()
             .id
             .clone();
-        let (gws_tx, mut gws_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gws_tx, mut gws_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, gws_tx);
         let gw = Arc::new(parking_lot::RwLock::new(gw));
 
@@ -2458,7 +2458,7 @@ mod tests {
             .read()
             .id
             .clone();
-        let (gws_tx, mut gws_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gws_tx, mut gws_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, gws_tx);
         let gw = Arc::new(parking_lot::RwLock::new(gw));
 
@@ -2560,7 +2560,7 @@ mod tests {
             .read()
             .id
             .clone();
-        let (gws_tx, mut gws_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gws_tx, mut gws_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, gws_tx);
         let gw = Arc::new(parking_lot::RwLock::new(gw));
 
@@ -3291,7 +3291,7 @@ mod tests {
             .read()
             .id
             .clone();
-        let (gws_tx, mut gws_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gws_tx, mut gws_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, gws_tx);
         let gw = Arc::new(parking_lot::RwLock::new(gw));
 
@@ -3405,7 +3405,7 @@ mod tests {
                 .read()
                 .id
                 .clone();
-            let (gws_tx, mut gws_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (gws_tx, mut gws_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
             gw.set_session_event_sender(&sid, gws_tx);
             let gw = Arc::new(parking_lot::RwLock::new(gw));
 

@@ -35,3 +35,6 @@ pub fn set_global_gateway(gateway: RwiGatewayRef) {
 pub fn global_gateway() -> Option<RwiGatewayRef> {
     GLOBAL_GATEWAY.get().cloned()
 }
+
+mod vbox_contract;
+pub mod bounded;

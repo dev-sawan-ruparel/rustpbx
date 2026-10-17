@@ -7861,7 +7861,7 @@ async fn rwi_manual_parallel_retry_and_leg_cleanup() {
 
     let gateway = Arc::new(parking_lot::RwLock::new(RwiGateway::new()));
     let mut events = gateway.read().subscribe_events();
-    let (ws_tx, mut ws_events) = mpsc::unbounded_channel();
+    let (ws_tx, mut ws_events) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
     {
         let mut gw = gateway.write();
         let id = gw.create_session(crate::rwi::RwiIdentity { token: "test".into(), scopes: vec!["call.control".into()] }).read().id.clone();
@@ -8198,8 +8198,8 @@ async fn rwi_route_app_waits_and_announces_to_configured_context() {
     use crate::call::runtime::AppFactory;
     use crate::call::app::{ApplicationContext, CallInfo, testing::MockCallStack};
     let gateway = Arc::new(parking_lot::RwLock::new(crate::rwi::RwiGateway::new()));
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (other_tx, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events_tx, mut events_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
+    let (other_tx, mut other_rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
     {
         let mut gw = gateway.write();
         for (context, tx) in [("test-router", events_tx), ("default", other_tx)] {

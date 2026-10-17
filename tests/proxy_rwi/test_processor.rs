@@ -1535,7 +1535,7 @@ async fn test_bridge_emits_event_to_gateway() {
     let _ha = create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
     let _hb = create_test_call(&registry, "leg-b", "1001", "2002", DialDirection::Outbound);
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = rustpbx::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
     {
         let mut gw = gateway.write();
         let identity = rustpbx::rwi::auth::RwiIdentity {
@@ -1691,7 +1691,7 @@ async fn test_unbridge_emits_call_unbridged_event_to_gateway() {
     let (_handle, _rx) =
         create_test_call_with_rx(&registry, "call-ev", "1001", "2000", DialDirection::Inbound);
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = rustpbx::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
     {
         let mut gw = gateway.write();
         let identity = rustpbx::rwi::auth::RwiIdentity {
@@ -3037,7 +3037,7 @@ async fn test_conference_seat_replace_failure_emits_failed_event() {
     let registry = Arc::new(ActiveProxyCallRegistry::new());
 
     let mut gateway_impl = RwiGateway::new();
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = rustpbx::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
     gateway_impl.set_session_event_sender(&"test-session".to_string(), event_tx);
     let gateway = Arc::new(RwLock::new(gateway_impl));
 

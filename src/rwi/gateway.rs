@@ -23,7 +23,7 @@ pub struct EventCacheEntry {
 }
 
 /// Sender for pushing JSON-serialized events to a WebSocket session.
-pub type WsEventSender = mpsc::UnboundedSender<serde_json::Value>;
+pub type WsEventSender = super::bounded::BoundedSender<serde_json::Value>;
 
 pub type RwiGatewayRef = StdArc<RwLock<RwiGateway>>;
 
@@ -901,7 +901,7 @@ mod tests {
     async fn test_broadcast_generic() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.broadcast(&crate::rwi::CallRinging {
             leg_id: None,
@@ -918,7 +918,7 @@ mod tests {
     async fn test_send_to_owner_generic() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "c1".into(), OwnershipMode::Control)
             .unwrap();
@@ -939,7 +939,7 @@ mod tests {
     async fn test_call_created_enriched_with_originating_agent() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "cti-1".into(), OwnershipMode::Control)
             .unwrap();
@@ -983,7 +983,7 @@ mod tests {
     async fn test_call_transferred_enrichment_keeps_transfer_source() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "c1".into(), OwnershipMode::Control)
             .unwrap();
@@ -1027,7 +1027,7 @@ mod tests {
     async fn test_call_finished_releases_both_ownership_indexes() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "c1".into(), OwnershipMode::Control)
             .unwrap();
@@ -1056,9 +1056,9 @@ mod tests {
     fn setup_owned_call(
         gw: &mut RwiGateway,
         call_id: &str,
-    ) -> mpsc::UnboundedReceiver<serde_json::Value> {
+    ) -> mpsc::Receiver<serde_json::Value> {
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, call_id.to_string(), OwnershipMode::Control)
             .unwrap();
@@ -1296,7 +1296,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_held_guard_survives_record_drop() {
         let gateway = StdArc::new(RwLock::new(RwiGateway::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         {
             let mut gw = gateway.write();
             let sid = gw.create_session(create_identity()).read().id.clone();
@@ -1351,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn test_call_record_guard_defers_cleanup_until_drop() {
         let gateway = StdArc::new(RwLock::new(RwiGateway::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         let sid = {
             let mut gateway = gateway.write();
             let sid = gateway.create_session(create_identity()).read().id.clone();
@@ -1453,7 +1453,7 @@ mod tests {
     async fn test_broadcast_event_enriches_with_meta() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.meta_store.insert(
@@ -1489,7 +1489,7 @@ mod tests {
     async fn test_broadcast_event_no_meta_untouched() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.broadcast_event(&crate::rwi::event::to_legacy_event(
@@ -1511,7 +1511,7 @@ mod tests {
     async fn test_broadcast_event_enriches_with_root() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.meta_store.insert(
@@ -1555,7 +1555,7 @@ mod tests {
     async fn test_broadcast_event_enriches_with_session_id() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.meta_store.insert(
@@ -1591,7 +1591,7 @@ mod tests {
     async fn test_broadcast_event_preserves_explicit_caller() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.meta_store.insert(
@@ -1642,7 +1642,7 @@ mod tests {
         let mut gw = RwiGateway::new();
         gw.set_node_ip(Some("10.0.0.1".to_string()));
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.broadcast_event(&crate::rwi::event::to_legacy_event(
@@ -1663,7 +1663,7 @@ mod tests {
         let mut gw = RwiGateway::new();
         gw.set_node_ip(Some("10.0.0.2".to_string()));
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "c1".into(), OwnershipMode::Control)
             .unwrap();
@@ -1685,7 +1685,7 @@ mod tests {
     async fn test_node_ip_absent_when_not_configured() {
         let mut gw = RwiGateway::new();
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.broadcast_event(&crate::rwi::event::to_legacy_event(
@@ -1706,7 +1706,7 @@ mod tests {
         let mut gw = RwiGateway::new();
         gw.set_node_ip(Some("10.0.0.1".to_string()));
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         let mut payload = serde_json::json!({
@@ -1743,7 +1743,7 @@ mod tests {
             }
         })));
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.broadcast_event(&crate::rwi::event::RwiEvent {
@@ -1769,7 +1769,7 @@ mod tests {
         let mut gw = RwiGateway::new();
         gw.set_client_ip_lookup(Some(std::sync::Arc::new(|_| None)));
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.broadcast_event(&crate::rwi::event::RwiEvent {
@@ -1795,7 +1795,7 @@ mod tests {
         let mut gw = RwiGateway::new();
         gw.set_client_ip_lookup(Some(std::sync::Arc::new(|_| Some("10.9.9.9".to_string()))));
         let sid = gw.create_session(create_identity()).read().id.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = super::super::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
 
         gw.broadcast_event(&crate::rwi::event::RwiEvent {

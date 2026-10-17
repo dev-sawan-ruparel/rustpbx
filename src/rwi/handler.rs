@@ -15,7 +15,6 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn rwi_ws_handler(
@@ -129,7 +128,10 @@ async fn handle_websocket(
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+    // Overflow of either per-session queue closes this session so a lost
+    // command/event is never mistaken for a synchronized control stream.
+    let session_cancel = tokio_util::sync::CancellationToken::new();
+    let (ws_tx, mut ws_rx) = super::bounded::channel::<String>(256, session_cancel.clone());
 
     let processor = {
         let conference_manager = sip_server
@@ -153,7 +155,7 @@ async fn handle_websocket(
         let mut gw = gateway.write();
         let session = gw.create_session(identity.clone());
         let id = session.read().id.clone();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (event_tx, mut event_rx) = super::bounded::channel::<serde_json::Value>(256, session_cancel.clone());
         let ws_tx_clone = ws_tx.clone();
         crate::utils::spawn(async move {
             while let Some(v) = event_rx.recv().await {
@@ -170,7 +172,7 @@ async fn handle_websocket(
     // session from the gateway and clean up its CallMeta entries.
     let _session_guard = GatewaySessionGuard::new(&gateway, &session_id);
 
-    let write_task = crate::utils::spawn(async move {
+    let mut write_task = crate::utils::spawn(async move {
         while let Some(msg) = ws_rx.recv().await {
             if ws_sender.send(Message::Text(msg.into())).await.is_err() {
                 break;
@@ -181,7 +183,7 @@ async fn handle_websocket(
     let session_id_clone = session_id.clone();
     let gateway_clone = gateway.clone();
     let ws_tx_clone = ws_tx.clone();
-    let recv_task = crate::utils::spawn(async move {
+    let mut recv_task = crate::utils::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
@@ -203,9 +205,17 @@ async fn handle_websocket(
     });
 
     tokio::select! {
-        _ = write_task => {}
-        _ = recv_task => {}
+        _ = &mut write_task => {}
+        _ = &mut recv_task => {}
+        _ = session_cancel.cancelled() => {
+            tracing::warn!(session_id = %session_id,
+                "Closing RWI session after bounded delivery failure");
+        }
     }
+    // Dropping a JoinHandle detaches its task. Explicitly stop both halves;
+    // otherwise a stalled writer can survive the gateway session's cleanup.
+    write_task.abort();
+    recv_task.abort();
 
     // _session_guard is dropped here → remove_session + CallMeta cleanup.
 }
@@ -218,7 +228,7 @@ async fn handle_text_message(
     processor: Arc<RwiCommandProcessor>,
     session_id: &str,
     gateway: RwiGatewayRef,
-    ws_tx: &mpsc::UnboundedSender<String>,
+    ws_tx: &super::bounded::BoundedSender<String>,
 ) {
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -236,6 +246,15 @@ async fn handle_text_message(
             return;
         }
     };
+
+    // A normalized command must never fall through to the native action
+    // dispatcher: partial translation would bypass the vbox safety contract.
+    if let Some(response) = super::vbox_contract::reply(&value) {
+        if let Ok(wire) = serde_json::to_string(&response) {
+            let _ = ws_tx.send(wire);
+        }
+        return;
+    }
 
     let action = match value.get("action").and_then(|v| v.as_str()) {
         Some(a) => a.to_string(),

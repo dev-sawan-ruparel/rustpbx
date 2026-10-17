@@ -427,7 +427,7 @@ async fn incoming_call_created_reaches_context_subscribers_before_attach() {
                 .read()
                 .id
                 .clone();
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
             gw.set_session_event_sender(&sid, tx);
             gw.subscribe(&sid, vec![context.into()], None);
             subscribers.push(rx);
@@ -4567,7 +4567,7 @@ async fn test_pinned_agent_rides_leg_and_session_call_ringing() {
             .read()
             .id
             .clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "test-session".to_string(), OwnershipMode::Control)
             .expect("claim the test session's call");
@@ -4689,7 +4689,7 @@ async fn test_pinned_agent_survives_slow_session_hooks() {
                 .read()
                 .id
                 .clone();
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
             gw.set_session_event_sender(&sid, tx);
             gw.claim_call_ownership(&sid, "test-session".to_string(), OwnershipMode::Control)
                 .expect("claim the test session's call");
@@ -4770,7 +4770,7 @@ async fn test_leg_ringing_without_pin_carries_no_agent() {
             .read()
             .id
             .clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::rwi::bounded::channel(256, tokio_util::sync::CancellationToken::new());
         gw.set_session_event_sender(&sid, tx);
         gw.claim_call_ownership(&sid, "test-session".to_string(), OwnershipMode::Control)
             .expect("claim the test session's call");

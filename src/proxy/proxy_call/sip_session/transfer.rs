@@ -1,3 +1,6 @@
+#[path = "bridge_pcm.rs"]
+mod bridge_pcm;
+
 use super::SipSession;
 use crate::call::domain::{CallCommand, LegId, LegState, ReturnAppSpec};
 use crate::media::negotiate::MediaNegotiator;
@@ -142,10 +145,14 @@ async fn bridge_forward_loop<S>(
             msg = ws_read.next() => {
                 let stream_closed = match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        buffered.extend(
-                            data.chunks_exact(2)
-                                .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]])),
-                        );
+                        match bridge_pcm::decode_pcm16le(&data) {
+                            Ok(samples) => buffered.extend(samples),
+                            Err(reason) => {
+                                warn!(session_id = %session_id, %leg_id, ?reason,
+                                    "Invalid PCM WebSocket frame; ending this bridge");
+                                break;
+                            }
+                        }
                         false
                     }
                     Some(Ok(Message::Text(txt))) => {
@@ -2696,10 +2703,7 @@ impl SipSession {
                                         } else {
                                             pcm
                                         };
-                                        let mut bytes = Vec::with_capacity(samples.len() * 2);
-                                        for s in &samples {
-                                            bytes.extend_from_slice(&s.to_ne_bytes());
-                                        }
+                                        let bytes = bridge_pcm::encode_pcm16le(&samples);
                                         tokio::select! {
                                             biased;
                                             _ = reverse_cancel.cancelled() => break,
@@ -3725,7 +3729,7 @@ mod tests {
         // 40 samples (5 ms at 8 kHz) — short of one 20 ms frame, so the tail
         // can only surface through the close→flush path of the forward loop.
         let samples: Vec<i16> = (0..40).map(|i| (i * 100) as i16).collect();
-        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_ne_bytes()).collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> =
             vec![Ok(Message::Binary(bytes.into())), Ok(Message::Close(None))];
@@ -3791,7 +3795,7 @@ mod tests {
         let tx_samples: Vec<i16> = (0..200).map(|i| (i * 100) as i16).collect();
         let mut tx_bytes = Vec::with_capacity(tx_samples.len() * 2);
         for s in &tx_samples {
-            tx_bytes.extend_from_slice(&s.to_ne_bytes());
+            tx_bytes.extend_from_slice(&s.to_le_bytes());
         }
 
         ws_write
@@ -3822,7 +3826,7 @@ mod tests {
 
         let mut buffered: Vec<i16> = rx_bytes
             .chunks_exact(2)
-            .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]]))
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
             .collect();
         let mut frames = Vec::new();
         while let Some(frame) = take_bridge_pcm_frame(&mut buffered, 160, true) {
