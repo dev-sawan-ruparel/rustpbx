@@ -35,6 +35,7 @@ pub mod session_id;
 pub mod sip;
 pub mod transcription;
 pub mod user;
+pub mod vbox_media;
 pub mod uui;
 pub use cookie::{
     CalleeDisplayName, CalleeOfflineMarker, CallerPeerContext, MatchedRoute, OutboundTrunkContext,
