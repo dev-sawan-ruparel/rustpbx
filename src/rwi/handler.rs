@@ -52,6 +52,10 @@ pub async fn rwi_ws_handler(
     };
 
     ws.protocols(["rwi-v1"])
+        // Bound authenticated input by bytes as well as by queue depth: one
+        // oversized frame closes only its own session.
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
         .on_upgrade(async move |socket| {
             handle_websocket(socket, identity, gateway, call_registry, sip_server).await;
         })
@@ -116,6 +120,12 @@ impl Drop for GatewaySessionGuard {
         for call_id in &call_ids {
             meta_store.remove(call_id);
         }
+        // A vbox controller that disconnects without being fenced by a
+        // successor starts the orphan hold (`I7`).
+        let vbox = self.gateway.read().vbox.clone();
+        if let Some(hold) = vbox.session_closed(&self.session_id) {
+            crate::rwi::vbox::control::spawn_orphan_timer(vbox, hold);
+        }
     }
 }
 
@@ -138,7 +148,7 @@ async fn handle_websocket(
             .as_ref()
             .map(|s| s.conference_manager.clone())
             .unwrap_or_else(|| Arc::new(crate::call::runtime::ConferenceManager::new()));
-        let p = RwiCommandProcessor::new(call_registry, gateway.clone(), conference_manager);
+        let p = RwiCommandProcessor::new(call_registry.clone(), gateway.clone(), conference_manager);
         let p = if let Some(server) = sip_server {
             p.with_sip_server(server)
         } else {
@@ -151,7 +161,7 @@ async fn handle_websocket(
     // disconnected sessions don't leak a subscriber + consumer task.
     let _transfer_listener = processor.register_transfer_notify_listener().await;
 
-    let session_id = {
+    let (session_id, session_events) = {
         let mut gw = gateway.write();
         let session = gw.create_session(identity.clone());
         let id = session.read().id.clone();
@@ -164,8 +174,8 @@ async fn handle_websocket(
                 }
             }
         });
-        gw.set_session_event_sender(&id, event_tx);
-        id
+        gw.set_session_event_sender(&id, event_tx.clone());
+        (id, event_tx)
     };
 
     // RAII: on any exit path (panic/return/select-complete), remove the
@@ -183,6 +193,7 @@ async fn handle_websocket(
     let session_id_clone = session_id.clone();
     let gateway_clone = gateway.clone();
     let ws_tx_clone = ws_tx.clone();
+    let contract_cancel = session_cancel.clone();
     let mut recv_task = crate::utils::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
@@ -194,6 +205,9 @@ async fn handle_websocket(
                         &session_id_clone,
                         gateway_clone.clone(),
                         &ws_tx_clone,
+                        &call_registry,
+                        &session_events,
+                        &contract_cancel,
                     )
                     .await;
                 }
@@ -223,12 +237,16 @@ async fn handle_websocket(
 /// Process one text frame from the WebSocket.
 ///
 /// Returns the JSON string to send back as a response (always — even for errors).
+#[allow(clippy::too_many_arguments)]
 async fn handle_text_message(
     text: &str,
     processor: Arc<RwiCommandProcessor>,
     session_id: &str,
     gateway: RwiGatewayRef,
     ws_tx: &super::bounded::BoundedSender<String>,
+    call_registry: &Arc<ActiveProxyCallRegistry>,
+    session_events: &super::bounded::BoundedSender<serde_json::Value>,
+    session_cancel: &tokio_util::sync::CancellationToken,
 ) {
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -249,9 +267,24 @@ async fn handle_text_message(
 
     // A normalized command must never fall through to the native action
     // dispatcher: partial translation would bypass the vbox safety contract.
-    if let Some(response) = super::vbox_contract::reply(&value) {
-        if let Ok(wire) = serde_json::to_string(&response) {
+    if super::vbox::is_contract_frame(&value) {
+        let reply = super::vbox::command::handle(
+            &value,
+            super::vbox::command::ContractContext {
+                session_id,
+                gateway: &gateway,
+                processor: &processor,
+                call_registry,
+                events: session_events,
+                cancel: session_cancel,
+            },
+        )
+        .await;
+        if let Ok(wire) = serde_json::to_string(&reply.reply) {
             let _ = ws_tx.send(wire);
+        }
+        for event in reply.follow_up {
+            let _ = session_events.send(event);
         }
         return;
     }

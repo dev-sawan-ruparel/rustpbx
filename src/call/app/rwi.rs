@@ -25,6 +25,20 @@ impl CallApp for RwiApp {
         _controller: &mut CallController,
         context: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
+        // vbox context: while no controller is connected (RWI down or orphan
+        // hold), new calls are refused rather than left ringing (`I7`).
+        let vbox = self.gateway.read().vbox.clone();
+        if self.context_name == vbox.context() && !vbox.accepting_inbound() {
+            tracing::warn!(
+                call_id = %context.call_info.session_id,
+                context = %self.context_name,
+                "rejecting inbound call: no vbox controller connected"
+            );
+            return Ok(AppAction::Hangup {
+                reason: Some(crate::callrecord::CallRecordHangupReason::BySystem),
+                code: Some(503),
+            });
+        }
         let event = CallCreated {
             call_id: context.call_info.session_id.clone(),
             context: self.context_name.clone(),

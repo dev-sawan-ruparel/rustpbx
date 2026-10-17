@@ -22,6 +22,9 @@ pub struct RwiConfig {
     pub originate_rate_limit: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<RwiTokenConfig>,
+    /// `[rwi.vbox]`: the normalized vbox call-control contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vbox: Option<crate::rwi::vbox::VboxContractConfig>,
 }
 
 impl Default for RwiConfig {
@@ -32,6 +35,7 @@ impl Default for RwiConfig {
             orphan_hold_secs: default_orphan_hold_secs(),
             originate_rate_limit: default_originate_rate_limit(),
             tokens: Vec::new(),
+            vbox: None,
         }
     }
 }
@@ -122,6 +126,7 @@ mod tests {
                     scopes: vec!["call.control".to_string(), "supervisor.control".to_string()],
                 },
             ],
+            vbox: None,
         }
     }
 

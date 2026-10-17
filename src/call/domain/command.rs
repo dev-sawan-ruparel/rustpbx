@@ -621,6 +621,16 @@ pub enum CallCommand {
     /// must not stay blocked by a bridge that is already gone.
     VoipBridgeClosed,
 
+    /// Attach (or re-attach) the caller leg to vbox media over
+    /// `/ws/rustpbx/:call_id` with generation-prefixed framing.
+    VboxMediaAttach(crate::call::vbox_media::VboxMediaStart),
+
+    /// A vbox media attachment ended (`media_session_id`, outcome).
+    VboxMediaClosed {
+        media_session_id: String,
+        outcome: crate::call::vbox_media::MediaOutput,
+    },
+
     /// Restore the MediaBridge route after an announcement/playback finished
     /// (re-activates fast-path relay or transcode). Issued internally when a
     /// playback handle's `done` resolves.

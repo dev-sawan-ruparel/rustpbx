@@ -115,6 +115,9 @@ pub struct RwiGateway {
     client_ip_lookup: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     /// Optional cross-node user-data replication hook (cluster mode only).
     user_data_sync: Option<UserDataSyncHook>,
+    /// vbox controller state (`pbx_command_v1`): ownership epochs, bindings,
+    /// tombstones and orphan hold for this PBX instance.
+    pub vbox: Arc<crate::rwi::vbox::VboxControl>,
 }
 
 #[derive(Debug)]
@@ -166,7 +169,15 @@ impl RwiGateway {
             node_ip: None,
             client_ip_lookup: None,
             user_data_sync: None,
+            vbox: Arc::new(crate::rwi::vbox::VboxControl::default()),
         }
+    }
+
+    /// Stop delivering native events to a session (a vbox controller
+    /// receives normalized events only).
+    pub fn suppress_native_events(&mut self, session_id: &SessionId) {
+        self.session_event_filters
+            .insert(session_id.clone(), HashSet::new());
     }
 
     /// Set this node's cluster-internal IP (`node_ip`). Called once at startup
@@ -374,6 +385,7 @@ impl RwiGateway {
     /// Remove all gateway-owned state after the call-record completion guard
     /// is dropped, or immediately when ownership is explicitly detached.
     pub fn call_finished(&mut self, call_id: &CallId) -> bool {
+        self.vbox.call_finished(call_id);
         let owner_id = self.call_ownership.remove(call_id);
         let released = owner_id
             .as_ref()
@@ -409,6 +421,14 @@ impl RwiGateway {
     /// webhook handler and the event tap. Broadcast targets do not cache —
     /// they are direct global sends.
     fn dispatch(&self, dispatch_call_id: &CallId, event: &RwiEvent, target: DispatchTarget) {
+        // vbox observes every call event regardless of native ownership or
+        // subscriptions, so bindings and tombstones stay correct while no
+        // controller is connected.
+        if !matches!(target, DispatchTarget::Broadcast)
+            && let Some(connect) = self.vbox.observe(event)
+        {
+            self.vbox.dispatch_media_connect(connect);
+        }
         match target {
             DispatchTarget::Broadcast => {
                 let enriched = self.enrich_flat_event(event);

@@ -433,6 +433,33 @@ impl AudioSource for VboxPlayoutSource {
     }
 }
 
+/// A request to attach a call to vbox media (`CallCommand::VboxMediaAttach`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VboxMediaStart {
+    /// Full WebSocket URL: configured base plus the `/ws/rustpbx/<call_id>`
+    /// path from the command.
+    pub url: String,
+    pub call_id: String,
+    pub binding_id: String,
+    pub media_session_id: String,
+    pub pbx_call_id: String,
+    pub pbx_instance_id: String,
+    pub max_buffer_ms: u64,
+    pub connect_timeout_ms: u64,
+}
+
+impl VboxMediaStart {
+    pub fn attachment(&self) -> MediaAttachment {
+        MediaAttachment {
+            call_id: self.call_id.clone(),
+            binding_id: self.binding_id.clone(),
+            media_session_id: self.media_session_id.clone(),
+            pbx_call_id: self.pbx_call_id.clone(),
+            pbx_instance_id: self.pbx_instance_id.clone(),
+        }
+    }
+}
+
 /// Identity of one media attachment, echoed in `start`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaAttachment {
@@ -466,7 +493,7 @@ pub fn start_message(att: &MediaAttachment) -> Value {
 }
 
 /// What the media session reports to the call that owns it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MediaOutput {
     /// vbox sent `ready` for this attachment.
     Ready,

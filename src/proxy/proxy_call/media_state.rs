@@ -8,6 +8,8 @@ pub enum ExternalBridgeKind {
     Voip,
     /// Realtime (AI voice) bridge.
     Realtime,
+    /// vbox media contract bridge (`/ws/rustpbx/:call_id`).
+    Vbox,
 }
 
 /// Handle to an EXTERNAL (WebSocket) media bridge attached to one leg —

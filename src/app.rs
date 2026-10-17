@@ -368,9 +368,11 @@ impl AppStateBuilder {
         // (e.g. RecordingUploadHook emits RecordingMetadataAvailable after upload).
         let rwi_gateway: Option<crate::rwi::RwiGatewayRef> =
             if config.rwi.is_some() || config.rwi_webhook.is_some() {
-                Some(std::sync::Arc::new(parking_lot::RwLock::new(
-                    crate::rwi::RwiGateway::new(),
-                )))
+                let gateway = crate::rwi::RwiGateway::new();
+                if let Some(vbox) = config.rwi.as_ref().and_then(|r| r.vbox.clone()) {
+                    gateway.vbox.set_config(vbox);
+                }
+                Some(std::sync::Arc::new(parking_lot::RwLock::new(gateway)))
             } else {
                 None
             };

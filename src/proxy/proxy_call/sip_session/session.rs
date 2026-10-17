@@ -11458,6 +11458,22 @@ impl SipSession {
                 Self::ok_or_failure(self.handle_realtime_stop(reason).await)
             }
 
+            CallCommand::VboxMediaAttach(start) => {
+                let pbx_call_id = start.pbx_call_id.clone();
+                let media_session_id = start.media_session_id.clone();
+                let result = self.handle_vbox_media_attach(start).await;
+                if let Err(e) = &result {
+                    warn!(session_id = %self.id, %pbx_call_id, %media_session_id, error = %e,
+                        "vbox media attach failed");
+                }
+                Self::ok_or_failure(result)
+            }
+
+            CallCommand::VboxMediaClosed { media_session_id, outcome } => {
+                self.handle_vbox_media_closed(media_session_id, outcome).await;
+                CommandResult::success()
+            }
+
             CallCommand::InjectAppEvent { event } => {
                 let event_value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
                 match self.app_runtime.inject_event(event_value) {

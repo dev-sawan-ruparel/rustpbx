@@ -4,6 +4,7 @@ mod prelude;
 
 mod builtin_app_factory;
 mod realtime_bridge;
+mod vbox_bridge;
 mod session;
 mod util;
 
