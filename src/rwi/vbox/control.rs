@@ -693,8 +693,10 @@ impl VboxControl {
                 if inner.controller.is_none() || inner.bindings.contains_key(call_id) {
                     return None;
                 }
-                let from = event.payload.get("caller").and_then(Value::as_str).unwrap_or("").to_string();
-                let to = event.payload.get("callee").and_then(Value::as_str).unwrap_or("").to_string();
+                let from_uri = event.payload.get("caller").and_then(Value::as_str).unwrap_or("");
+                let to_uri = event.payload.get("callee").and_then(Value::as_str).unwrap_or("");
+                let from = sip_user(from_uri);
+                let to = sip_user(to_uri);
                 inner.discovered.insert(
                     call_id.to_string(),
                     Discovered {
@@ -708,6 +710,8 @@ impl VboxControl {
                 v["pbx_leg_id"] = json!(call_id);
                 v["from"] = json!(from);
                 v["to"] = json!(to);
+                v["from_uri"] = json!(from_uri);
+                v["to_uri"] = json!(to_uri);
                 v["sip_headers"] = event
                     .payload
                     .get("sip_headers")
@@ -733,21 +737,7 @@ impl VboxControl {
                 Self::emit_locked(&inner, v);
                 None
             }
-            "call_answered" if leg_id.is_none() => {
-                let mut inner = self.inner.lock();
-                let binding = inner.bindings.get_mut(call_id)?;
-                if binding.answered_at_ms.is_some() {
-                    return None;
-                }
-                let answered_at = now_ms();
-                binding.answered_at_ms = Some(answered_at);
-                binding.state = "answered";
-                let mut v = self.binding_event("answered", binding);
-                v["answered_at"] = json!(answered_at);
-                let connect = self.connect_if_ready(binding);
-                Self::emit_locked(&inner, v);
-                connect
-            }
+            "call_answered" if leg_id.is_none() => self.mark_answered(call_id),
             "call_busy" => {
                 let mut inner = self.inner.lock();
                 if let Some(b) = inner.bindings.get_mut(call_id) {
@@ -815,6 +805,26 @@ impl VboxControl {
             }
             _ => None,
         }
+    }
+
+    /// The telephony leg is answered: emit `answered` once and start media
+    /// if vbox already asked for it. Fed by the session-level
+    /// `call_answered` event and by the caller-leg answer of an app-anchored
+    /// call (which upstream deliberately does not report as `call_answered`).
+    pub fn mark_answered(&self, pbx_call_id: &str) -> Option<MediaConnect> {
+        let mut inner = self.inner.lock();
+        let binding = inner.bindings.get_mut(pbx_call_id)?;
+        if binding.answered_at_ms.is_some() {
+            return None;
+        }
+        let answered_at = now_ms();
+        binding.answered_at_ms = Some(answered_at);
+        binding.state = "answered";
+        let mut v = self.binding_event("answered", binding);
+        v["answered_at"] = json!(answered_at);
+        let connect = self.connect_if_ready(binding);
+        Self::emit_locked(&inner, v);
+        connect
     }
 
     fn is_outbound(&self, pbx_call_id: &str) -> bool {
@@ -1138,6 +1148,23 @@ impl VboxControl {
     }
 }
 
+/// The user part of a SIP/tel URI (`"Bob" <sip:+1555@h;x=y>` → `+1555`), so
+/// vbox routes on the dialled number rather than PBX host details.
+pub fn sip_user(uri: &str) -> String {
+    let inner = match (uri.find('<'), uri.rfind('>')) {
+        (Some(a), Some(b)) if b > a => &uri[a + 1..b],
+        _ => uri,
+    };
+    let inner = inner.trim();
+    let rest = inner
+        .strip_prefix("sips:")
+        .or_else(|| inner.strip_prefix("sip:"))
+        .or_else(|| inner.strip_prefix("tel:"))
+        .unwrap_or(inner);
+    let user = rest.split('@').next().unwrap_or(rest);
+    user.split(';').next().unwrap_or(user).to_string()
+}
+
 /// Identifies one call in `get_call`.
 #[derive(Debug, Default, Clone)]
 pub struct SnapshotFilter {
@@ -1250,7 +1277,7 @@ mod tests {
         let control = VboxControl::default();
         let (mut rx, _c) = session(&control, "a");
         control.fence("a", 1);
-        control.observe(&native("call_created", "pbx-1", json!({"context":"vbox","caller":"+1555","callee":"+1666"})));
+        control.observe(&native("call_created", "pbx-1", json!({"context":"vbox","caller":"sip:+1555@carrier","callee":"sip:+1666@pbx:5060"})));
         let events = drain(&mut rx);
         assert_eq!(events[0]["type"], "incoming_call");
         assert_eq!(events[0]["pbx_call_id"], "pbx-1");
@@ -1414,13 +1441,30 @@ mod tests {
     }
 
     #[test]
+    fn sip_user_extracts_the_dialled_number() {
+        assert_eq!(sip_user("sip:vboxline@127.0.0.1:5060"), "vboxline");
+        assert_eq!(sip_user("\"Bob\" <sip:+15550100@carrier.example;user=phone>"), "+15550100");
+        assert_eq!(sip_user("tel:+15550199"), "+15550199");
+        assert_eq!(sip_user("+15550199"), "+15550199");
+        assert_eq!(sip_user("sips:1001@pbx;transport=tls"), "1001");
+    }
+
+    #[test]
     fn capabilities_are_derived_from_implemented_set() {
+        // Without a media endpoint the contract cannot be served.
         let control = VboxControl::default();
         let caps = control.capabilities();
         assert_eq!(caps["contract"], "pbx_command_v1");
         assert_eq!(caps["integration_ready"], false);
-        let missing = caps["missing_capabilities"].as_array().unwrap();
-        assert!(missing.iter().any(|m| m == "generation_u64_pcm16le"));
+        assert_eq!(caps["media_configured"], false);
+        assert_eq!(caps["missing_capabilities"], json!([]));
         assert_eq!(caps["supported_operations"].as_array().unwrap().len(), OPERATIONS.len());
+        let mut config = VboxContractConfig::default();
+        config.media_base_url = Some("wss://vbox.internal:4000".into());
+        let ready = VboxControl::new(config).capabilities();
+        assert_eq!(ready["integration_ready"], true);
+        for required in REQUIRED_CAPABILITIES {
+            assert!(ready["capabilities"].as_array().unwrap().iter().any(|c| c == required), "{required}");
+        }
     }
 }

@@ -60,11 +60,28 @@ pub const REQUIRED_CAPABILITIES: &[&str] = &[
     "non_blocking_clear",
 ];
 
+///
+/// Evidence (`tests/rwi/vbox_contract_e2e.rs` runs a real SIP caller/callee
+/// with RTP against the production RWI handler and media path):
+/// - `owner_epoch_fencing`: `vbox_contract_owner_epoch_takeover_closes_stale_controller`
+/// - `list_owned_calls`, `terminal_tombstones`: inbound, orphan and outbound e2e tests
+/// - `generation_u64_pcm16le`, `clear`, `non_blocking_clear`, `mark`, `dtmf`,
+///   `close_4000_hangup`: `vbox_contract_inbound_full_duplex_clear_mark_dtmf_and_agent_hangup`
+/// - `close_4001_orphan`: `vbox_contract_orphan_hold_survives_then_expires_with_4001`
+/// - `media_reattach`: `vbox_contract_media_reattach_supersedes_the_old_socket`
 pub const IMPLEMENTED_CAPABILITIES: &[&str] = &[
     "capabilities",
     "owner_epoch_fencing",
     "list_owned_calls",
     "terminal_tombstones",
+    "generation_u64_pcm16le",
+    "clear",
+    "mark",
+    "dtmf",
+    "close_4000_hangup",
+    "close_4001_orphan",
+    "media_reattach",
+    "non_blocking_clear",
 ];
 
 /// `[rwi.vbox]` configuration.

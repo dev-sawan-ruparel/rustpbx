@@ -22,3 +22,6 @@ mod userdata_e2e;
 
 #[path = "rwi/wire_format.rs"]
 mod wire_format;
+
+#[path = "rwi/vbox_contract_e2e.rs"]
+mod vbox_contract_e2e;

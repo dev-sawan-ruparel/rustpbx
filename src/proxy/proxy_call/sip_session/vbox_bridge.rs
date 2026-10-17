@@ -26,6 +26,17 @@ impl SipSession {
             .map(|gw| gw.read().vbox.clone())
     }
 
+    /// A vbox-bound call's caller leg was answered by command. Upstream emits
+    /// no session `call_answered` while an app holds the call, so tell the
+    /// vbox controller state directly (no-op for calls vbox does not own).
+    pub(crate) fn notify_vbox_caller_answered(&self) {
+        if let Some(control) = self.vbox_control()
+            && let Some(connect) = control.mark_answered(&self.context.session_id)
+        {
+            control.dispatch_media_connect(connect);
+        }
+    }
+
     /// `CallCommand::VboxMediaAttach` — connect the caller leg to vbox media.
     /// A re-attach (new `media_session_id`) replaces the playout source; the
     /// previous socket was already asked to close by the controller state.

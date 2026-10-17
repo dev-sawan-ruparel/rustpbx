@@ -5502,6 +5502,7 @@ impl SipSession {
         let Some(pending) = self.pending_refers.remove(target_leg) else {
             return;
         };
+        let pending_target = pending.target.clone();
         self.meta.transfer_in_progress = false;
         if status == 200 {
             if !self.server.session_hooks.is_empty() {
@@ -5546,6 +5547,24 @@ impl SipSession {
                 .as_ref()
                 .is_none_or(|dialog| dialog.state().is_terminated())
         {
+            // A vbox agent still attached over `/ws/rustpbx` keeps the caller:
+            // a failed transfer returns the call to the agent, not to hangup.
+            if self
+                .external_bridge
+                .as_ref()
+                .is_some_and(|h| h.kind == crate::proxy::proxy_call::media_state::ExternalBridgeKind::Vbox)
+            {
+                info!(session_id = %self.id, status, "Transfer failed; caller stays with the vbox agent");
+                self.emit_typed_rwi_event(&crate::rwi::CallTransferFailed {
+                    call_id: self.context.session_id.clone(),
+                    sip_status: Some(status),
+                    reason: Some(format!("transfer target answered {status}")),
+                    transfer_target: Some(pending_target),
+                    transfer_target_type: Some("sip".to_string()),
+                });
+                self.update_media_path().await;
+                return;
+            }
             self.handle_start_return_app().await;
         }
     }
@@ -11289,6 +11308,7 @@ impl SipSession {
                         Ok(()) => {
                             self.update_leg_state(&leg_id, LegState::Connected);
                             self.update_media_path().await;
+                            self.notify_vbox_caller_answered();
                             CommandResult::success()
                         }
                         Err(e) => CommandResult::failure(e.to_string()),
