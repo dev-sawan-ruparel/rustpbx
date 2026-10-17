@@ -560,6 +560,9 @@ async fn vbox_contract_inbound_full_duplex_clear_mark_dtmf_and_agent_hangup() {
     let snap = ctl.command("list_owned_calls", 1, json!({"payload": {"include_terminated_since": 0}})).await;
     assert_eq!(snap["type"], "snapshot_response");
     assert_eq!(snap["active_calls"], json!([]));
+    assert_eq!(snap["pbx_instance_id"], "pbx-e2e");
+    assert_eq!(snap["tombstone_window_covers"], true);
+    assert!(snap["snapshot_at_ms"].as_i64().unwrap() > 0);
 
     let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
     let rtp = CallerRtp::bind().await;

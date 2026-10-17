@@ -112,6 +112,9 @@ struct Inner {
     discovered: HashMap<String, Discovered>,
     tombstones: VecDeque<Tombstone>,
     tombstone_seq: u64,
+    /// Tombstones dropped (count bound or retention) since this boot. While
+    /// zero, every call that ended in this boot epoch is still answerable.
+    tombstones_evicted: u64,
     orphan_generation: u64,
     orphan_since: Option<Instant>,
     call_registry: Option<Arc<ActiveProxyCallRegistry>>,
@@ -940,6 +943,7 @@ impl VboxControl {
         let retention = Duration::from_secs(config.tombstone_retention_secs);
         while inner.tombstones.len() > config.max_tombstones {
             inner.tombstones.pop_front();
+            inner.tombstones_evicted += 1;
         }
         while inner
             .tombstones
@@ -947,6 +951,7 @@ impl VboxControl {
             .is_some_and(|t| t.recorded.elapsed() > retention)
         {
             inner.tombstones.pop_front();
+            inner.tombstones_evicted += 1;
         }
     }
 
@@ -1054,7 +1059,12 @@ impl VboxControl {
             "active_calls": active,
             "terminal_tombstones": tombstones,
             "terminated_cursor": inner.tombstone_seq,
+            "snapshot_at_ms": now_ms(),
             "tombstone_retention_secs": self.config.read().tombstone_retention_secs,
+            "tombstone_retention_ms": self.config.read().tombstone_retention_secs * 1000,
+            // True while no tombstone of this boot epoch has been dropped, so
+            // a call absent from the snapshot provably never reached the PBX.
+            "tombstone_window_covers": inner.tombstones_evicted == 0,
         })
     }
 
@@ -1306,6 +1316,8 @@ mod tests {
         assert_eq!(ended[0]["final_state"], "completed");
         let snap = control.snapshot("cmd-s", None, 0);
         assert_eq!(snap["type"], "snapshot_response");
+        assert_eq!(snap["pbx_instance_id"], "rustpbx");
+        assert_eq!(snap["tombstone_window_covers"], true);
         assert_eq!(snap["active_calls"].as_array().unwrap().len(), 0);
         let tombs = snap["terminal_tombstones"].as_array().unwrap();
         assert_eq!(tombs.len(), 1);
@@ -1405,6 +1417,9 @@ mod tests {
         assert_eq!(tombs.len(), 3);
         assert_eq!(tombs[0]["pbx_call_id"], "pbx-2");
         assert_eq!(snap["terminated_cursor"], 5);
+        assert_eq!(snap["tombstone_window_covers"], false, "evicted tombstones void coverage");
+        assert_eq!(snap["tombstone_retention_ms"], 3_600_000);
+        assert!(snap["snapshot_at_ms"].as_i64().unwrap() > 0);
         // Cursor filtering returns only newer tombstones.
         let newer = control.snapshot("s", None, 4);
         assert_eq!(newer["terminal_tombstones"].as_array().unwrap().len(), 1);
