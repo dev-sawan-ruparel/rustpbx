@@ -240,8 +240,16 @@ impl MessageInspector for NatInspector {
                     rsipstack::sip::StatusCodeKind::Provisional
                         | rsipstack::sip::StatusCodeKind::Successful
                 );
+            // With a Record-Route set, in-dialog requests (ACK, BYE) go to the
+            // first route and the Contact must stay the Request-URI. A carrier
+            // whose proxies front a private media server (Telnyx) never got
+            // the 2xx ACK once the Contact was rewritten to the proxy.
+            let has_record_route = resp
+                .headers
+                .iter()
+                .any(|h| matches!(h, rsipstack::sip::Header::RecordRoute(_)));
 
-            if is_target_forming {
+            if is_target_forming && !has_record_route {
                 for header in resp.headers.iter_mut() {
                     if let rsipstack::sip::Header::Contact(contact) = header {
                         let mut val = contact.value().to_string();
@@ -338,6 +346,37 @@ mod tests {
         let text = NatInspector::new().after_received(msg, Some(&from)).to_string();
         assert!(
             text.contains("Contact: <sip:trunkuser@10.0.0.5:15060>;expires=600"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_nat_fix_leaves_record_routed_response_contact_untouched() {
+        // Telnyx 200 OK to an outbound INVITE (2026-10-18 trace): the Contact
+        // is a private media server reached through the Record-Route proxies.
+        // Rewriting it to the proxy sent the ACK to the proxy itself; Telnyx
+        // retransmitted the 200 OK and hung up after 32 s.
+        let raw = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/TLS 203.0.113.80:5061;received=203.0.113.80;branch=z9hG4bK2xjwuya27ZAG;rport=49854;alias\r\n",
+            "Record-Route: <sip:10.255.0.1;r2=on;lr;ftag=frSXLbOA>\r\n",
+            "Record-Route: <sip:192.76.120.10:5061;transport=tls;r2=on;lr;ftag=frSXLbOA>\r\n",
+            "From: <sip:+15550100001@203.0.113.80>;tag=frSXLbOA\r\n",
+            "To: <sip:+15550100002@sip.telnyx.com>;tag=S7mcF1XgvDcZr\r\n",
+            "Call-ID: vbx-71908d70d5354fc3a7b03fa137e54ca4\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:+15550100002@10.239.44.224:5070;transport=udp>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n"
+        );
+        let msg = SipMessage::try_from(raw).unwrap();
+        let from: SipAddr = rsipstack::sip::HostWithPort::try_from("192.76.120.10:5061")
+            .unwrap()
+            .into();
+
+        let text = NatInspector::new().after_received(msg, Some(&from)).to_string();
+        assert!(
+            text.contains("Contact: <sip:+15550100002@10.239.44.224:5070;transport=udp>"),
             "{text}"
         );
     }
