@@ -844,6 +844,52 @@ async fn vbox_contract_reconnect_inside_orphan_hold_keeps_the_call() {
     h.server.stop();
 }
 
+/// Agent hangup of an answered inbound (`rwi` app) call: contract `hangup`
+/// — and vbox's follow-up `4000` close of the media socket, which arrives
+/// while the PBX is already tearing the call down — BYE the caller promptly.
+/// Live 2026-10-19: the caller dialog was never BYEd ("Timed out waiting for
+/// cleanup hangups") and the caller sat on silence until it hung up.
+#[tokio::test]
+async fn vbox_contract_inbound_hangup_byes_the_caller() {
+    for close_media_with_4000 in [false, true] {
+        let mut h = harness(30).await;
+        let mut ctl = Controller::connect(&h.rwi_url).await;
+        ctl.command("list_owned_calls", 1, json!({"payload": {"include_terminated_since": 0}})).await;
+        let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+        let rtp = CallerRtp::bind().await;
+        let call_id = format!("call-hup-{close_media_with_4000}");
+        let (pbx_call_id, dialog, pbx_rtp, mut media) =
+            establish_inbound(&mut h, &mut ctl, &alice, &rtp, 1, &call_id, "m-hup").await;
+        rtp.send_tone(pbx_rtp, CALLER_TONE_HZ, 20);
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            let _ = tokio::time::timeout(Duration::from_millis(50), media.next()).await;
+        }
+
+        let sent = Instant::now();
+        let hangup = ctl
+            .command("hangup", 1, json!({"call_id": call_id, "payload": {"pbx_call_id": pbx_call_id, "reason": "agent_hangup"}}))
+            .await;
+        assert_eq!(hangup["type"], "command_ack", "{hangup}");
+        if close_media_with_4000 {
+            let _ = media
+                .send(Message::Close(Some(CloseFrame { code: 4000.into(), reason: "agent_hangup".into() })))
+                .await;
+        }
+        let bye = wait_for_ua_event(&alice, Duration::from_secs(3), |e| {
+            matches!(e, TestUaEvent::CallTerminated(d) if *d == dialog)
+        })
+        .await;
+        let after = sent.elapsed();
+        assert!(bye.is_some(), "caller received no BYE within 3 s of contract hangup (4000 close: {close_media_with_4000})");
+        assert!(after < Duration::from_secs(1), "caller BYE took {after:?} (4000 close: {close_media_with_4000})");
+        let ended = ctl.event("call_ended", Duration::from_secs(5)).await;
+        assert_eq!(ended["call_id"], call_id.as_str());
+        rtp.cancel.cancel();
+        h.server.stop();
+    }
+}
+
 /// Outbound: originate with pre-assigned identity, early correlation,
 /// answer → media attach, duplicate command id never dials twice, hangup.
 #[tokio::test]
