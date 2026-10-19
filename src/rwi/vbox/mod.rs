@@ -98,6 +98,9 @@ pub struct VboxContractConfig {
     pub media_base_url: Option<String>,
     #[serde(default)]
     pub pbx_instance_id: Option<String>,
+    /// Trusted routing identity for this controller/trunk deployment.
+    #[serde(default)]
+    pub provider_connection_id: Option<String>,
     /// How long established calls survive a controller disconnect.
     #[serde(default = "default_orphan_hold_secs")]
     pub orphan_hold_secs: u64,
@@ -144,6 +147,7 @@ impl Default for VboxContractConfig {
             context: default_context(),
             media_base_url: None,
             pbx_instance_id: None,
+            provider_connection_id: None,
             orphan_hold_secs: default_orphan_hold_secs(),
             tombstone_retention_secs: default_tombstone_retention_secs(),
             max_tombstones: default_max_tombstones(),

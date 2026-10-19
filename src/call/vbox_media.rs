@@ -19,7 +19,7 @@
 //! the moment it is read even while seconds of audio are queued. Audio is
 //! consumed one tick at a time by [`VboxPlayoutSource`] from the leg egress,
 //! and a `mark` is acknowledged only after every sample queued before it has
-//! been handed to the RTP encoder.
+//! been successfully written by the RTP transport (not proof of remote hearing).
 
 use crate::media::audio_source::AudioSource;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -44,6 +44,11 @@ pub const CLOSE_RWI_ORPHAN_TIMEOUT: u16 = 4001;
 /// Upper bound on any inbound WebSocket message from vbox. A text control is
 /// a few hundred bytes; the largest binary frame is 8 + 6400 bytes.
 pub const MAX_MEDIA_MESSAGE_BYTES: usize = 64 * 1024;
+/// Bounded reader replies and RTP completion events. Overflow terminates the
+/// attachment rather than dropping a confirmation/control acknowledgement.
+pub const MEDIA_CONTROL_CAPACITY: usize = 128;
+pub const MAX_PENDING_MARKS: usize = 128;
+pub const MEDIA_WRITE_TIMEOUT_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -192,6 +197,9 @@ pub struct Playout {
     pub overflow_frames: u64,
     pub played_samples: u64,
     closed: bool,
+    playback_stopped: CancellationToken,
+    read_marks: Vec<Mark>,
+    in_flight: VecDeque<(u32, std::time::Instant, Vec<Mark>)>,
 }
 
 fn now_ms() -> i64 {
@@ -203,8 +211,8 @@ fn samples_to_ms(samples: usize) -> u64 {
 }
 
 impl Playout {
-    /// `max_buffer_ms` bounds queued audio; frames beyond it are dropped and
-    /// reported with `flow_control` `overflow`.
+    /// `max_buffer_ms` bounds queued audio. Overflow closes the attachment:
+    /// dropped audio must never be followed by a successful confirmation.
     pub fn new(max_buffer_ms: u64) -> Self {
         Self {
             active_generation: 0,
@@ -216,6 +224,9 @@ impl Playout {
             overflow_frames: 0,
             played_samples: 0,
             closed: false,
+            playback_stopped: CancellationToken::new(),
+            read_marks: Vec::new(),
+            in_flight: VecDeque::new(),
         }
     }
 
@@ -229,6 +240,10 @@ impl Playout {
 
     pub fn close(&mut self) {
         self.closed = true;
+        self.read_marks.clear();
+        self.in_flight.clear();
+        self.queue.clear();
+        self.queued_samples = 0;
     }
 
     pub fn is_closed(&self) -> bool {
@@ -254,12 +269,16 @@ impl Playout {
     }
 
     pub fn push_pcm(&mut self, generation: u64, samples: Vec<i16>, out: &mut Vec<MediaEvent>) -> PushOutcome {
+        if self.closed {
+            return PushOutcome::Overflow;
+        }
         if generation < self.active_generation {
             self.stale_frames += 1;
             return PushOutcome::Stale;
         }
         if self.queued_samples + samples.len() > self.max_samples {
             self.overflow_frames += 1;
+            self.close();
             out.push(MediaEvent::FlowControl {
                 level: "overflow",
                 buffered_ms: self.buffered_ms(),
@@ -277,20 +296,25 @@ impl Playout {
     }
 
     /// Queue a mark after everything already queued. A mark for a cleared
-    /// generation is reported `mark_cleared` at once; a mark with nothing
-    /// queued ahead of it has had all of its audio handed to RTP already.
+    /// generation is reported `mark_cleared` at once. Even an empty-queue
+    /// mark waits for a transport receipt, fencing previously in-flight audio.
     pub fn push_mark(&mut self, mark: Mark, out: &mut Vec<MediaEvent>) {
+        if self.closed {
+            return;
+        }
+        if self.queue.iter().filter(|item| matches!(item, Item::Mark(_))).count() + self.read_marks.len() + self.in_flight.iter().map(|(_, _, marks)| marks.len()).sum::<usize>() >= MAX_PENDING_MARKS {
+            self.close();
+            out.clear();
+            return;
+        }
         if mark.generation < self.active_generation {
             out.push(MediaEvent::MarkCleared { mark });
             return;
         }
-        if self.queue.is_empty() {
-            out.push(MediaEvent::MarkPlayed {
-                mark,
-                played_at_ms: now_ms(),
-            });
-            return;
-        }
+        // A full 20 ms of zero input drains the pinned 24-tap FIR and codec
+        // lookahead before the receipt boundary. It shares the audio byte cap;
+        // failure to reserve the guard closes the attachment, never confirms.
+        if self.push_pcm(mark.generation, vec![0; SAMPLES_PER_20MS], out) != PushOutcome::Queued { return; }
         self.queue.push_back(Item::Mark(mark));
     }
 
@@ -300,6 +324,11 @@ impl Playout {
         let active = self.active_generation;
         let mut discarded_samples = 0usize;
         let mut cleared_marks = Vec::new();
+        for marks in std::iter::once(&mut self.read_marks).chain(self.in_flight.iter_mut().map(|(_, _, marks)| marks)) {
+            marks.retain(|mark| {
+                if mark.generation < active { cleared_marks.push(mark.clone()); false } else { true }
+            });
+        }
         self.queue.retain(|item| match item {
             Item::Pcm {
                 generation,
@@ -329,17 +358,18 @@ impl Playout {
 
     /// Fill one egress tick. Returns the number of samples written (the full
     /// buffer, zero-padded when the response ends mid-tick) or `0` on
-    /// underrun. Marks reached are emitted as `mark_played`.
+    /// underrun. Reached marks wait for the corresponding RTP write receipt.
     pub fn read(&mut self, buffer: &mut [i16], out: &mut Vec<MediaEvent>) -> usize {
+        if self.in_flight.front().is_some_and(|(_, at, _)| at.elapsed() >= std::time::Duration::from_secs(1)) {
+            self.close();
+        }
+        if self.closed { return 0; }
         let mut filled = 0usize;
         loop {
             match self.queue.front_mut() {
                 Some(Item::Mark(_)) => {
                     if let Some(Item::Mark(mark)) = self.queue.pop_front() {
-                        out.push(MediaEvent::MarkPlayed {
-                            mark,
-                            played_at_ms: now_ms(),
-                        });
+                        self.read_marks.push(mark);
                     }
                     // Audio before the mark has been consumed; finish this
                     // tick with silence padding so the mark is not delayed.
@@ -369,10 +399,7 @@ impl Playout {
         // Emit marks that now sit at the head: their audio is fully consumed.
         while let Some(Item::Mark(_)) = self.queue.front() {
             if let Some(Item::Mark(mark)) = self.queue.pop_front() {
-                out.push(MediaEvent::MarkPlayed {
-                    mark,
-                    played_at_ms: now_ms(),
-                });
+                self.read_marks.push(mark);
             }
         }
         self.watermark(out);
@@ -384,6 +411,26 @@ impl Playout {
         }
         buffer.len()
     }
+    fn prepare_rtp(&mut self, timestamp: u32) {
+        if self.closed { return; }
+        if self.in_flight.len() >= 128 || self.in_flight.iter().any(|(ts, _, _)| *ts == timestamp) {
+            self.close(); return;
+        }
+        self.in_flight.push_back((timestamp, std::time::Instant::now(), std::mem::take(&mut self.read_marks)));
+    }
+
+    fn transmitted(&mut self, timestamp: u32, sent: bool, out: &mut Vec<MediaEvent>) {
+        if self.closed { return; }
+        let Some(index) = self.in_flight.iter().position(|(ts, _, _)| *ts == timestamp) else { return; };
+        // The normal sender is serial. Missing/reordered receipts cannot prove the prefix.
+        if !sent || index != 0 { self.close(); return; }
+        let (_, _, marks) = self.in_flight.pop_front().unwrap();
+        for mark in marks {
+            if mark.generation < self.active_generation { out.push(MediaEvent::MarkCleared { mark }); }
+            else { out.push(MediaEvent::MarkPlayed { mark, played_at_ms: now_ms() }); }
+        }
+    }
+
 }
 
 pub type SharedPlayout = Arc<parking_lot::Mutex<Playout>>;
@@ -393,27 +440,70 @@ pub type SharedPlayout = Arc<parking_lot::Mutex<Playout>>;
 /// forwarded to the media writer.
 pub struct VboxPlayoutSource {
     playout: SharedPlayout,
-    events: mpsc::UnboundedSender<MediaEvent>,
+    events: mpsc::Sender<MediaEvent>,
+    cancel: CancellationToken,
     scratch: Vec<MediaEvent>,
 }
 
 impl VboxPlayoutSource {
-    pub fn new(playout: SharedPlayout, events: mpsc::UnboundedSender<MediaEvent>) -> Self {
-        Self {
-            playout,
-            events,
-            scratch: Vec::new(),
+    pub fn new(playout: SharedPlayout, events: mpsc::Sender<MediaEvent>, cancel: CancellationToken) -> Self {
+        Self { playout, events, cancel, scratch: Vec::new() }
+    }
+    fn flush(&mut self) {
+        for event in self.scratch.drain(..) {
+            if self.events.try_send(event).is_err() { self.playout.lock().close(); self.cancel.cancel(); break; }
         }
+        if self.playout.lock().is_closed() { self.cancel.cancel(); }
+    }
+}
+
+/// Only the post-write callback can release a mark. The expected audio SSRC
+/// rejects unrelated video/relay packets; the timestamp identifies a queued frame.
+pub struct VboxTransmissionObserver {
+    pub playout: std::sync::Weak<parking_lot::Mutex<Playout>>,
+    pub events: mpsc::Sender<MediaEvent>,
+    pub cancel: CancellationToken,
+    pub ssrc: u32,
+    pub payload_type: u8,
+}
+impl rustrtc::peer_connection::RtpObserver for VboxTransmissionObserver {
+    fn on_egress_result(&self, packet: &rustrtc::rtp::RtpPacket, sent: bool) {
+        if packet.header.ssrc != self.ssrc || packet.header.payload_type != self.payload_type || self.cancel.is_cancelled() { return; }
+        let Some(playout) = self.playout.upgrade() else { return; };
+        let mut p = playout.lock();
+        let mut events = Vec::new();
+        p.transmitted(packet.header.timestamp, sent, &mut events);
+        for event in events { if self.events.try_send(event).is_err() { p.close(); break; } }
+        if p.is_closed() && !p.playback_stopped.is_cancelled() { self.cancel.cancel(); }
+    }
+}
+
+impl Drop for VboxPlayoutSource {
+    fn drop(&mut self) {
+        let mut playout = self.playout.lock();
+        let failed = playout.is_closed();
+        playout.close();
+        if failed { self.cancel.cancel(); return; }
+        // Source replacement is a normal lifecycle boundary (e.g. transfer).
+        // Revoke marks immediately, then let the writer send a bounded close.
+        // Transport/queue failures still use the hard cancellation token.
+        playout.playback_stopped.cancel();
     }
 }
 
 impl AudioSource for VboxPlayoutSource {
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
         let n = self.playout.lock().read(buffer, &mut self.scratch);
-        for event in self.scratch.drain(..) {
-            let _ = self.events.send(event);
-        }
+        self.flush();
         n
+    }
+    fn prepare_rtp(&mut self, timestamp: u32) {
+        self.playout.lock().prepare_rtp(timestamp);
+        self.flush();
+    }
+    fn rtp_enqueue_failed(&mut self) {
+        self.playout.lock().close();
+        self.cancel.cancel();
     }
 
     fn sample_rate(&self) -> u32 {
@@ -529,13 +619,13 @@ impl Default for MediaLimits {
 pub struct MediaIo {
     pub playout: SharedPlayout,
     /// Events emitted on the RTP side by [`VboxPlayoutSource`].
-    pub playout_events: mpsc::UnboundedReceiver<MediaEvent>,
+    pub playout_events: mpsc::Receiver<MediaEvent>,
     /// Caller PCM at 16 kHz, one 20 ms frame per message.
     pub uplink: mpsc::Receiver<Vec<i16>>,
     /// Caller DTMF digits (already de-duplicated by the session).
-    pub caller_dtmf: mpsc::UnboundedReceiver<String>,
+    pub caller_dtmf: mpsc::Receiver<String>,
     pub close_requests: mpsc::Receiver<CloseRequest>,
-    pub outputs: mpsc::UnboundedSender<MediaOutput>,
+    pub outputs: mpsc::Sender<MediaOutput>,
     pub cancel: CancellationToken,
 }
 
@@ -553,6 +643,36 @@ fn close_message(code: u16, reason: &str) -> Message {
         code: CloseCode::from(code),
         reason: reason.to_string().into(),
     }))
+}
+
+/// A blocked WebSocket write cannot outlive cancellation or its deadline.
+async fn send_media<S>(sink: &mut S, message: Message, cancel: &CancellationToken) -> bool
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        result = tokio::time::timeout(
+            std::time::Duration::from_millis(MEDIA_WRITE_TIMEOUT_MS), sink.send(message)
+        ) => matches!(result, Ok(Ok(()))),
+    }
+}
+
+// Watermarks originate on both the WebSocket reader and RTP task. Their
+// notifications can arrive out of order after releasing the playout lock.
+// Serialize the current hysteresis latch, not a stale producer snapshot.
+fn current_control_event(event: MediaEvent, playout: &SharedPlayout) -> MediaEvent {
+    match event {
+        MediaEvent::FlowControl { level: "high_water" | "low_water", .. } => {
+            let p = playout.lock();
+            MediaEvent::FlowControl {
+                level: if p.high_water { "high_water" } else { "low_water" },
+                buffered_ms: p.buffered_ms(),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Run one attachment until the socket closes, the call cancels it, or the
@@ -578,7 +698,7 @@ where
     } = io;
     let (mut ws_write, mut ws_read) = ws.split();
     // Reader → writer control replies (`cleared`, `mark_*`, `flow_control`).
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<MediaEvent>();
+    let (reply_tx, mut reply_rx) = mpsc::channel::<MediaEvent>(MEDIA_CONTROL_CAPACITY);
     let session_cancel = cancel.child_token();
 
     let reader = {
@@ -589,7 +709,7 @@ where
         tokio::spawn(async move {
             let mut malformed = 0u32;
             let mut scratch = Vec::new();
-            let end: MediaOutput = loop {
+            let end: MediaOutput = 'reader: loop {
                 let msg = tokio::select! {
                     biased;
                     _ = session_cancel.cancelled() => break MediaOutput::Closed { code: None, reason: "cancelled".into() },
@@ -638,11 +758,15 @@ where
                             },
                             "dtmf" => {
                                 if let Some(digits) = value.get("digit").and_then(Value::as_str) {
-                                    let _ = outputs.send(MediaOutput::SendDtmf { digits: digits.to_string() });
+                                    if outputs.capacity() <= 1 || outputs.try_send(MediaOutput::SendDtmf { digits: digits.to_string() }).is_err() {
+                                        break MediaOutput::Closed { code: Some(1011), reason: "output_queue_overflow".into() };
+                                    }
                                 }
                             }
                             "ready" => {
-                                let _ = outputs.send(MediaOutput::Ready);
+                                if outputs.capacity() <= 1 || outputs.try_send(MediaOutput::Ready).is_err() {
+                                    break MediaOutput::Closed { code: Some(1011), reason: "output_queue_overflow".into() };
+                                }
                             }
                             "stop" => {
                                 break MediaOutput::Closed { code: Some(CLOSE_NORMAL), reason: "stop".into() };
@@ -664,48 +788,53 @@ where
                     }
                     None => break MediaOutput::Closed { code: None, reason: "eof".into() },
                 }
+                if playout.lock().is_closed() {
+                    let stopped = playout.lock().playback_stopped.is_cancelled();
+                    if stopped {
+                        session_cancel.cancelled().await;
+                        break MediaOutput::Closed { code: None, reason: "cancelled".into() };
+                    }
+                    break MediaOutput::Closed { code: Some(1011), reason: "playout_queue_overflow".into() };
+                }
                 for event in scratch.drain(..) {
-                    let _ = reply_tx.send(event);
+                    if reply_tx.try_send(event).is_err() {
+                        break 'reader MediaOutput::Closed { code: Some(1011), reason: "control_queue_overflow".into() };
+                    }
                 }
             };
-            for event in scratch.drain(..) {
-                let _ = reply_tx.send(event);
-            }
+            // Never flush pending acknowledgements after failure/cancellation.
             end
         })
     };
 
-    // Writer: controls first, then PBX-initiated close, DTMF, caller audio.
+    // Each write is deadline- and cancellation-aware, including start/close.
+    // Close requests outrank controls so a busy peer cannot starve teardown.
     let start = start_message(&att).to_string();
     let writer_cancel = session_cancel.clone();
+    let playback_stopped = playout.lock().playback_stopped.clone();
+    let writer_playout = playout.clone();
     let writer = tokio::spawn(async move {
-        if ws_write.send(Message::Text(start.into())).await.is_err() {
+        if !send_media(&mut ws_write, Message::Text(start.into()), &writer_cancel).await {
             return None;
         }
         let mut pending_close: Option<CloseRequest> = None;
         loop {
-            tokio::select! {
+            let message = tokio::select! {
                 biased;
                 _ = writer_cancel.cancelled() => break,
-                Some(event) = reply_rx.recv() => {
-                    if ws_write.send(Message::Text(event.to_json().to_string().into())).await.is_err() {
-                        break;
-                    }
-                }
-                Some(event) = playout_events.recv() => {
-                    if ws_write.send(Message::Text(event.to_json().to_string().into())).await.is_err() {
-                        break;
-                    }
-                }
                 Some(request) = close_requests.recv() => {
-                    // Flush control replies already produced before closing.
-                    while let Ok(event) = reply_rx.try_recv() {
-                        let _ = ws_write.send(Message::Text(event.to_json().to_string().into())).await;
-                    }
-                    let _ = ws_write.send(close_message(request.code, &request.reason)).await;
+                    let message = close_message(request.code, &request.reason);
                     pending_close = Some(request);
-                    break;
+                    message
                 }
+                _ = playback_stopped.cancelled() => {
+                    let request = CloseRequest { code: CLOSE_NORMAL, reason: "playback_stopped".into() };
+                    let message = close_message(request.code, &request.reason);
+                    pending_close = Some(request);
+                    message
+                }
+                Some(event) = reply_rx.recv() => Message::Text(current_control_event(event, &writer_playout).to_json().to_string().into()),
+                Some(event) = playout_events.recv() => Message::Text(current_control_event(event, &writer_playout).to_json().to_string().into()),
                 Some(digit) = caller_dtmf.recv() => {
                     let payload = json!({
                         "schema_version": MEDIA_SCHEMA,
@@ -715,19 +844,25 @@ where
                         "event_id": uuid::Uuid::new_v4().to_string(),
                         "duration_ms": 100,
                     });
-                    if ws_write.send(Message::Text(payload.to_string().into())).await.is_err() {
-                        break;
-                    }
+                    Message::Text(payload.to_string().into())
                 }
-                Some(samples) = uplink.recv() => {
-                    if ws_write.send(Message::Binary(encode_pcm16le(&samples).into())).await.is_err() {
-                        break;
-                    }
-                }
+                Some(samples) = uplink.recv() => Message::Binary(encode_pcm16le(&samples).into()),
                 else => break,
+            };
+            if !send_media(&mut ws_write, message, &writer_cancel).await {
+                return None;
+            }
+            if pending_close.is_some() {
+                break;
             }
         }
-        let _ = ws_write.close().await;
+        // Dropping the sink closes the transport; a graceful close must not
+        // wait forever for a peer that stopped reading.
+        tokio::select! {
+            biased;
+            _ = writer_cancel.cancelled() => {}
+            _ = tokio::time::timeout(std::time::Duration::from_millis(MEDIA_WRITE_TIMEOUT_MS), ws_write.close()) => {}
+        }
         pending_close
     });
 
@@ -750,7 +885,8 @@ where
         }
     };
     playout.lock().close();
-    let _ = outputs.send(output);
+    // The reader always reserves one slot for this terminal outcome.
+    let _ = outputs.try_send(output);
 }
 
 #[cfg(test)]
@@ -794,7 +930,7 @@ mod tests {
             assert_eq!(p.push_pcm(1, tone(100, 320), &mut out), PushOutcome::Queued);
         }
         p.push_mark(mark("m1", 1), &mut out);
-        assert_eq!(p.buffered_ms(), 4000);
+        assert_eq!(p.buffered_ms(), 4020);
         // Play two ticks first.
         let mut buf = vec![0i16; 320];
         assert_eq!(p.read(&mut buf, &mut out), 320);
@@ -806,7 +942,7 @@ mod tests {
         assert_eq!(out[0], MediaEvent::MarkCleared { mark: mark("m1", 1) });
         assert!(matches!(
             out[1],
-            MediaEvent::Cleared { generation: 2, discarded_frames: 198, discarded_ms: 3960 }
+            MediaEvent::Cleared { generation: 2, discarded_frames: 199, discarded_ms: 3980 }
         ));
         // Stale frames after clear are rejected; current generation plays.
         assert_eq!(p.push_pcm(1, tone(100, 320), &mut out), PushOutcome::Stale);
@@ -841,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_is_played_only_after_its_audio_is_consumed() {
+    fn mark_is_played_only_after_successful_transmission() {
         let mut p = Playout::new(10_000);
         let mut out = Vec::new();
         p.push_pcm(1, tone(9, 640), &mut out);
@@ -849,8 +985,17 @@ mod tests {
         assert!(out.is_empty(), "mark must not be acknowledged before playout");
         let mut buf = vec![0i16; 320];
         p.read(&mut buf, &mut out);
+        p.prepare_rtp(100);
+        p.transmitted(100, true, &mut out);
         assert!(out.is_empty(), "half the audio is still queued");
         p.read(&mut buf, &mut out);
+        p.prepare_rtp(200);
+        p.transmitted(200, true, &mut out);
+        assert!(out.is_empty(), "response tail still needs its guard packet");
+        p.read(&mut buf, &mut out);
+        p.prepare_rtp(300);
+        assert!(out.is_empty(), "consumption does not prove transmission");
+        p.transmitted(300, true, &mut out);
         assert!(matches!(&out[0], MediaEvent::MarkPlayed { mark: m, .. } if m.mark_id == "m1"));
     }
 
@@ -865,6 +1010,12 @@ mod tests {
         assert_eq!(p.read(&mut buf, &mut out), 320);
         assert!(buf[..100].iter().all(|s| *s == 5));
         assert!(buf[100..].iter().all(|s| *s == 0));
+        p.prepare_rtp(100);
+        p.transmitted(100, true, &mut out);
+        assert!(out.is_empty());
+        p.read(&mut buf, &mut out);
+        p.prepare_rtp(200);
+        p.transmitted(200, true, &mut out);
         assert!(matches!(&out[0], MediaEvent::MarkPlayed { mark: m, .. } if m.mark_id == "tail"));
         assert_eq!(p.read(&mut buf, &mut out), 320);
         assert!(buf.iter().all(|s| *s == 6));
@@ -878,8 +1029,12 @@ mod tests {
         out.clear();
         p.push_mark(mark("now", 5), &mut out);
         p.push_mark(mark("old", 4), &mut out);
+        assert_eq!(out.pop().unwrap(), MediaEvent::MarkCleared { mark: mark("old", 4) });
+        assert!(out.is_empty());
+        p.read(&mut [0; 320], &mut out);
+        p.prepare_rtp(100);
+        p.transmitted(100, true, &mut out);
         assert!(matches!(&out[0], MediaEvent::MarkPlayed { mark: m, .. } if m.mark_id == "now"));
-        assert_eq!(out[1], MediaEvent::MarkCleared { mark: mark("old", 4) });
     }
 
     #[test]
@@ -898,7 +1053,8 @@ mod tests {
         for _ in 0..3 {
             p.read(&mut buf, &mut out);
         }
-        assert!(out.iter().any(|e| matches!(e, MediaEvent::FlowControl { level: "low_water", .. })));
+        assert!(p.is_closed(), "overflow cannot silently drop audio then confirm a mark");
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -909,16 +1065,141 @@ mod tests {
         assert_eq!(p.read(&mut buf, &mut out), 0);
     }
 
+
+    #[tokio::test]
+    async fn real_transport_success_failure_and_clear_gate_marks() {
+        use rustrtc::transports::{ice::{conn::IceConn, IceSocketWrapper}, rtp::RtpTransport};
+        use tokio::{net::UdpSocket, sync::watch};
+        for mode in 0..3 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (_socket_tx, socket_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+            let transport = RtpTransport::new(IceConn::new(socket_rx, peer.local_addr().unwrap(), None), mode == 1);
+            let playout = Arc::new(parking_lot::Mutex::new(Playout::new(1000)));
+            let (events, mut rx) = mpsc::channel(128);
+            let cancel = CancellationToken::new();
+            transport.add_observer(Arc::new(VboxTransmissionObserver { playout: Arc::downgrade(&playout), events: events.clone(), cancel: cancel.clone(), ssrc: 42, payload_type: 0 }));
+            let mut out = Vec::new();
+            playout.lock().push_pcm(1, tone(4, 320), &mut out);
+            playout.lock().push_mark(mark("wire", 1), &mut out);
+            let mut source = VboxPlayoutSource::new(playout.clone(), events, cancel.clone());
+            source.read_samples(&mut [0; 320]);
+            source.read_samples(&mut [0; 320]);
+            source.prepare_rtp(160);
+            assert!(rx.try_recv().is_err(), "reading and packet enqueue never confirm");
+            if mode == 2 { playout.lock().clear(2, &mut out); }
+            let packet = rustrtc::rtp::RtpPacket::new(rustrtc::rtp::RtpHeader::new(0, 1, 160, 42), vec![9;160]);
+            let result = transport.send_rtp(packet).await;
+            if mode == 1 {
+                assert!(result.is_err(), "SRTP without keys fails actual transport");
+                assert!(cancel.is_cancelled());
+                assert!(rx.try_recv().is_err());
+            } else {
+                assert!(result.unwrap() > 0);
+                let mut bytes = [0; 1500];
+                assert!(tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv(&mut bytes)).await.unwrap().unwrap() > 0);
+                if mode == 0 { assert!(matches!(rx.try_recv().unwrap(), MediaEvent::MarkPlayed { .. })); }
+                else { assert!(rx.try_recv().is_err(), "clear fences late successful send"); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_mark_flushes_fir_tail_over_real_pcmu_rtp_and_ignores_dtmf_collision() {
+        use rustrtc::transports::{ice::{conn::IceConn, IceSocketWrapper}, rtp::RtpTransport};
+        use tokio::{net::UdpSocket, sync::watch};
+        use crate::media::audio_source::ResamplingAudioSource;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let transport = RtpTransport::new(IceConn::new(rx, peer.local_addr().unwrap(), None), false);
+        let playout = Arc::new(parking_lot::Mutex::new(Playout::new(1000)));
+        let (events, mut receipts) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        transport.add_observer(Arc::new(VboxTransmissionObserver { playout: Arc::downgrade(&playout), events: events.clone(), cancel: cancel.clone(), ssrc: 42, payload_type: 0 }));
+        let raw = VboxPlayoutSource::new(playout.clone(), events, cancel);
+        let mut source = ResamplingAudioSource::new(Box::new(raw), 8000);
+        let mut encoder = audio_codec::create_encoder(audio_codec::CodecType::PCMU);
+        let mut decoder = audio_codec::create_decoder(audio_codec::CodecType::PCMU);
+        let mut impulse = vec![0; 320];
+        impulse[319] = 30000;
+        playout.lock().push_pcm(1, impulse, &mut Vec::new());
+        let mut pcm = [0; 160];
+        assert_eq!(source.read_samples(&mut pcm), 160);
+        source.prepare_rtp(160);
+        let packet = rustrtc::rtp::RtpPacket::new(rustrtc::rtp::RtpHeader::new(0, 1, 160, 42), encoder.encode(&pcm).to_vec());
+        transport.send_rtp(packet).await.unwrap();
+        assert!(receipts.try_recv().is_err());
+        // The mark arrives after the preceding audio's write has completed.
+        playout.lock().push_mark(mark("late", 1), &mut Vec::new());
+        assert_eq!(source.read_samples(&mut pcm), 160);
+        assert!(pcm.iter().any(|sample| sample.abs() > 200), "guard carries the otherwise-lost FIR tail");
+        source.prepare_rtp(320);
+        let dtmf = rustrtc::rtp::RtpPacket::new(rustrtc::rtp::RtpHeader::new(101, 2, 320, 42), vec![1, 0, 0, 160]);
+        transport.send_rtp(dtmf).await.unwrap();
+        assert!(receipts.try_recv().is_err(), "same timestamp/SSRC DTMF cannot release an audio mark");
+        let guard = rustrtc::rtp::RtpPacket::new(rustrtc::rtp::RtpHeader::new(0, 3, 320, 42), encoder.encode(&pcm).to_vec());
+        transport.send_rtp(guard).await.unwrap();
+        assert!(matches!(receipts.try_recv().unwrap(), MediaEvent::MarkPlayed { mark: m, .. } if m.mark_id == "late"));
+        let mut bytes = [0; 1500];
+        for _ in 0..3 {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv(&mut bytes)).await.unwrap().unwrap();
+            if bytes[1] & 0x7f == 0 && u32::from_be_bytes(bytes[4..8].try_into().unwrap()) == 320 {
+                let decoded = decoder.decode(&bytes[12..n]);
+                assert!(decoded.iter().any(|sample| sample.abs() > 200), "tail must reach actual remote RTP payload");
+                return;
+            }
+        }
+        panic!("guard RTP packet was not received");
+    }
+
+    #[test]
+    fn failed_missing_or_out_of_order_transmission_never_confirms() {
+        for mode in 0..3 {
+            let mut p = Playout::new(1000);
+            let mut out = Vec::new();
+            p.push_pcm(1, tone(4, 320), &mut out);
+            p.push_mark(mark("confirm", 1), &mut out);
+            p.read(&mut [0; 320], &mut out);
+            p.read(&mut [0; 320], &mut out);
+            p.prepare_rtp(100);
+            match mode {
+                0 => p.transmitted(100, false, &mut out),
+                1 => { p.in_flight.front_mut().unwrap().1 -= std::time::Duration::from_secs(2); p.read(&mut [0; 320], &mut out); }
+                _ => { p.prepare_rtp(200); p.transmitted(200, true, &mut out); }
+            }
+            p.transmitted(100, true, &mut out);
+            assert!(p.is_closed());
+            assert!(!out.iter().any(|e| matches!(e, MediaEvent::MarkPlayed { .. })));
+        }
+    }
+
+    #[test]
+    fn clear_invalidates_mark_waiting_for_transport() {
+        let mut p = Playout::new(1000);
+        let mut out = Vec::new();
+        p.push_pcm(1, tone(4, 320), &mut out);
+        p.push_mark(mark("confirm", 1), &mut out);
+        p.read(&mut [0; 320], &mut out);
+        p.read(&mut [0; 320], &mut out);
+        p.prepare_rtp(100);
+        p.clear(2, &mut out);
+        assert!(out.iter().any(|e| matches!(e, MediaEvent::MarkCleared { .. })));
+        out.clear();
+        p.transmitted(100, true, &mut out);
+        assert!(out.is_empty());
+    }
+
     // ── WebSocket session over a real loopback socket ─────────────────────
 
     struct Harness {
         vbox: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         playout: SharedPlayout,
-        playout_events_tx: mpsc::UnboundedSender<MediaEvent>,
+        playout_events_tx: mpsc::Sender<MediaEvent>,
         uplink_tx: mpsc::Sender<Vec<i16>>,
-        dtmf_tx: mpsc::UnboundedSender<String>,
+        dtmf_tx: mpsc::Sender<String>,
         close_tx: mpsc::Sender<CloseRequest>,
-        outputs: mpsc::UnboundedReceiver<MediaOutput>,
+        outputs: mpsc::Receiver<MediaOutput>,
         cancel: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
@@ -934,22 +1215,31 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with_slow_reader(false).await
+    }
+
+    async fn harness_with_slow_reader(slow: bool) -> Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            if slow {
+                socket2::SockRef::from(&stream).set_recv_buffer_size(1024).unwrap();
+            }
             tokio_tungstenite::accept_async(stream).await.unwrap()
         });
-        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/rustpbx/call-1"))
-            .await
-            .unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        if slow {
+            socket2::SockRef::from(&stream).set_send_buffer_size(1024).unwrap();
+        }
+        let (client, _) = tokio_tungstenite::client_async(format!("ws://{addr}/ws/rustpbx/call-1"), stream).await.unwrap();
         let vbox = accept.await.unwrap();
         let playout: SharedPlayout = Arc::new(parking_lot::Mutex::new(Playout::new(10_000)));
-        let (playout_events_tx, playout_events) = mpsc::unbounded_channel();
+        let (playout_events_tx, playout_events) = mpsc::channel(MEDIA_CONTROL_CAPACITY);
         let (uplink_tx, uplink) = mpsc::channel(50);
-        let (dtmf_tx, caller_dtmf) = mpsc::unbounded_channel();
+        let (dtmf_tx, caller_dtmf) = mpsc::channel(MEDIA_CONTROL_CAPACITY);
         let (close_tx, close_requests) = mpsc::channel(4);
-        let (outputs_tx, outputs) = mpsc::unbounded_channel();
+        let (outputs_tx, outputs) = mpsc::channel(MEDIA_CONTROL_CAPACITY + 1);
         let cancel = CancellationToken::new();
         let io = MediaIo {
             playout: playout.clone(),
@@ -988,6 +1278,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_high_water_cannot_repause_drained_playout_over_real_websocket() {
+        let mut h = harness().await;
+        let _ = next_text(&mut h.vbox).await;
+        let mut delayed_high = Vec::new();
+        let mut low = Vec::new();
+        {
+            let mut p = h.playout.lock();
+            // Hold the producer's notification after releasing the shared lock,
+            // exactly the scheduling window between push_pcm/read and flush.
+            p.push_pcm(1, vec![1; SAMPLE_RATE as usize * 8], &mut delayed_high);
+            assert!(p.high_water);
+            p.read(&mut vec![0; SAMPLE_RATE as usize * 4], &mut low);
+            assert!(!p.high_water);
+        }
+        assert!(matches!(delayed_high.as_slice(), [MediaEvent::FlowControl { level: "high_water", .. }]));
+        assert!(matches!(low.as_slice(), [MediaEvent::FlowControl { level: "low_water", .. }]));
+        h.playout_events_tx.send(low.pop().unwrap()).await.unwrap();
+        assert_eq!(next_text(&mut h.vbox).await["level"], "low_water");
+        h.playout_events_tx.send(delayed_high.pop().unwrap()).await.unwrap();
+        let latest = next_text(&mut h.vbox).await;
+        h.cancel.cancel();
+        h.task.await.unwrap();
+        assert_eq!(latest["level"], "low_water", "late producer notification must not re-pause an already drained queue");
+        assert_eq!(latest["buffered_ms"], 4000);
+    }
+
+    #[tokio::test]
+    async fn delayed_watermarks_follow_clear_and_rehigh_hysteresis_over_real_websocket() {
+        let mut h = harness().await;
+        let _ = next_text(&mut h.vbox).await;
+        let mut high = Vec::new();
+        let mut cleared = Vec::new();
+        {
+            let mut p = h.playout.lock();
+            p.push_pcm(1, vec![1; SAMPLE_RATE as usize * 8], &mut high);
+            p.clear(2, &mut cleared);
+            assert!(!p.high_water);
+        }
+        h.playout_events_tx.send(high.pop().unwrap()).await.unwrap();
+        let low_wire = next_text(&mut h.vbox).await;
+        assert_eq!(low_wire["level"], "low_water");
+        assert_eq!(low_wire["buffered_ms"], 0);
+        let low = cleared.pop().unwrap();
+        assert!(matches!(low, MediaEvent::FlowControl { level: "low_water", .. }));
+        {
+            let mut p = h.playout.lock();
+            p.push_pcm(2, vec![2; SAMPLE_RATE as usize * 8], &mut Vec::new());
+            p.read(&mut vec![0; SAMPLE_RATE as usize * 2], &mut Vec::new());
+            // Between low and high thresholds, retain the high latch.
+            assert!(p.high_water);
+        }
+        h.playout_events_tx.send(low).await.unwrap();
+        let high_wire = next_text(&mut h.vbox).await;
+        assert_eq!(high_wire["level"], "high_water");
+        assert_eq!(high_wire["buffered_ms"], 6000);
+        h.playout_events_tx.send(MediaEvent::FlowControl { level: "overflow", buffered_ms: 123 }).await.unwrap();
+        let overflow = next_text(&mut h.vbox).await;
+        assert_eq!(overflow["level"], "overflow");
+        assert_eq!(overflow["buffered_ms"], 123);
+        h.cancel.cancel();
+        h.task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_sends_start_then_caller_audio_and_dtmf() {
         let mut h = harness().await;
         let start = next_text(&mut h.vbox).await;
@@ -1004,7 +1358,7 @@ mod tests {
         let Message::Binary(bytes) = msg else { panic!("expected caller PCM") };
         assert_eq!(bytes.len(), 640);
         assert_eq!(&bytes[..2], &[0x02, 0x01], "little endian");
-        h.dtmf_tx.send("5".into()).unwrap();
+        h.dtmf_tx.try_send("5".into()).unwrap();
         let dtmf = next_text(&mut h.vbox).await;
         assert_eq!(dtmf["type"], "dtmf");
         assert_eq!(dtmf["digit"], "5");
@@ -1048,7 +1402,7 @@ mod tests {
         assert_eq!(first["mark_id"], "m1");
         assert_eq!(second["type"], "cleared");
         assert_eq!(second["generation"], 2);
-        assert_eq!(second["discarded_ms"], 4000);
+        assert_eq!(second["discarded_ms"], 4020);
         assert!(elapsed < std::time::Duration::from_millis(200), "clear took {elapsed:?}");
         assert_eq!(h.playout.lock().buffered_ms(), 0);
         h.cancel.cancel();
@@ -1056,7 +1410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_played_comes_from_the_rtp_side_consumer() {
+    async fn consumption_alone_never_emits_mark_played() {
         let mut h = harness().await;
         let _start = next_text(&mut h.vbox).await;
         h.vbox
@@ -1079,9 +1433,15 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(100), h.vbox.next()).await.is_err(),
             "no mark_played before playout"
         );
-        let mut source = VboxPlayoutSource::new(h.playout.clone(), h.playout_events_tx.clone());
+        let mut source = VboxPlayoutSource::new(h.playout.clone(), h.playout_events_tx.clone(), h.cancel.clone());
         let mut buf = vec![0i16; 320];
         assert_eq!(source.read_samples(&mut buf), 320);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), h.vbox.next()).await.is_err());
+        source.read_samples(&mut buf);
+        source.prepare_rtp(123);
+        let mut events = Vec::new();
+        h.playout.lock().transmitted(123, true, &mut events);
+        for event in events { h.playout_events_tx.try_send(event).unwrap(); }
         let played = next_text(&mut h.vbox).await;
         assert_eq!(played["type"], "mark_played");
         assert_eq!(played["mark_id"], "confirm-1");
@@ -1089,6 +1449,23 @@ mod tests {
         assert_eq!(played["turn_id"], "t9");
         assert_eq!(played["response_id"], "r9");
         h.cancel.cancel();
+        let _ = h.task.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_source_revokes_marks_and_gracefully_closes_real_socket() {
+        let mut h = harness().await;
+        let _ = next_text(&mut h.vbox).await;
+        let mut out = Vec::new();
+        h.playout.lock().push_mark(mark("never-confirm", 1), &mut out);
+        let mut source = VboxPlayoutSource::new(h.playout.clone(), h.playout_events_tx.clone(), h.cancel.clone());
+        source.read_samples(&mut [0; 320]);
+        source.prepare_rtp(100);
+        drop(source);
+        h.playout.lock().transmitted(100, true, &mut out);
+        assert!(!out.iter().any(|event| matches!(event, MediaEvent::MarkPlayed { .. })));
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), h.vbox.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(frame, Message::Close(Some(frame)) if u16::from(frame.code) == CLOSE_NORMAL));
         let _ = h.task.await;
     }
 
@@ -1174,4 +1551,127 @@ mod tests {
         h.cancel.cancel();
         let _ = h.task.await;
     }
+    // Exercise the production write helper against an actual TCP/WebSocket
+    // peer that completes its handshake and then stops reading entirely.
+    async fn stalled_socket() -> (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            socket2::SockRef::from(&stream).set_recv_buffer_size(1024).unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket2::SockRef::from(&stream).set_send_buffer_size(1024).unwrap();
+        let (sender, _) = tokio_tungstenite::client_async(format!("ws://{addr}/stalled"), stream).await.unwrap();
+        (sender, accept.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn stalled_real_websocket_write_obeys_cancellation() {
+        let (mut sender, _nonreading_peer) = stalled_socket().await;
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            send_media(&mut sender, Message::Binary(vec![0; 16 * 1024 * 1024].into()), &writer_cancel).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "real socket must be blocked before cancellation");
+        cancel.cancel();
+        assert!(!tokio::time::timeout(std::time::Duration::from_millis(250), task).await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stalled_real_websocket_write_obeys_deadline() {
+        let (mut sender, _nonreading_peer) = stalled_socket().await;
+        let cancel = CancellationToken::new();
+        let began = std::time::Instant::now();
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(3),
+            send_media(&mut sender, Message::Binary(vec![0; 16 * 1024 * 1024].into()), &cancel)
+        ).await.unwrap();
+        assert!(!sent, "a stalled write must not report success");
+        assert!(began.elapsed() >= std::time::Duration::from_millis(MEDIA_WRITE_TIMEOUT_MS));
+    }
+
+    #[tokio::test]
+    async fn pending_mark_flood_closes_real_media_session_without_played_ack() {
+        let mut h = harness().await;
+        let _start = next_text(&mut h.vbox).await;
+        h.vbox.send(Message::Binary(encode_generation_frame(1, &tone(9, 320)).into())).await.unwrap();
+        // No egress consumes this audio; every mark remains pending.
+        for n in 0..=MAX_PENDING_MARKS {
+            h.vbox.send(Message::Text(json!({"type":"mark", "mark_id": format!("m{n}"), "generation":1})
+                .to_string().into())).await.unwrap();
+        }
+        let output = tokio::time::timeout(std::time::Duration::from_secs(2), h.outputs.recv()).await.unwrap().unwrap();
+        assert_eq!(output, MediaOutput::Closed { code: Some(1011), reason: "playout_queue_overflow".into() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), h.task).await.unwrap().unwrap();
+        assert!(h.playout.lock().is_closed());
+        while let Ok(Some(Ok(message))) = tokio::time::timeout(std::time::Duration::from_millis(100), h.vbox.next()).await {
+            if let Message::Text(text) = message {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(value["type"], "mark_played");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn control_reply_flood_ends_session_when_real_peer_stops_reading() {
+        let mut h = harness_with_slow_reader(true).await;
+        let _start = next_text(&mut h.vbox).await;
+        h.playout.lock().clear(2, &mut Vec::new());
+        // Each stale mark creates a large mark_cleared reply. The real socket
+        // backpressures the writer; the independent reader fills its bounded
+        // reply channel and must terminate instead of waiting for the writer.
+        let message = Message::Text(json!({"type":"mark", "mark_id":"x".repeat(60_000), "generation":1}).to_string().into());
+        let flood = tokio::spawn(async move {
+            for _ in 0..1000 {
+                if h.vbox.send(message.clone()).await.is_err() { break; }
+            }
+            h.vbox
+        });
+        let output = tokio::time::timeout(std::time::Duration::from_secs(3), h.outputs.recv()).await.unwrap().unwrap();
+        assert_eq!(output, MediaOutput::Closed { code: Some(1011), reason: "control_queue_overflow".into() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), h.task).await.unwrap().unwrap();
+        assert!(h.playout.lock().is_closed());
+        flood.abort();
+        let _ = flood.await;
+    }
+
+    #[tokio::test]
+    async fn output_flood_reserves_terminal_outcome_slot() {
+        let mut h = harness().await;
+        let _start = next_text(&mut h.vbox).await;
+        for _ in 0..=MEDIA_CONTROL_CAPACITY {
+            h.vbox.send(Message::Text(json!({"type":"ready"}).to_string().into())).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), h.task).await.unwrap().unwrap();
+        assert!(h.playout.lock().is_closed());
+        for _ in 0..MEDIA_CONTROL_CAPACITY {
+            assert_eq!(h.outputs.recv().await, Some(MediaOutput::Ready));
+        }
+        assert_eq!(h.outputs.recv().await, Some(MediaOutput::Closed { code: Some(1011), reason: "output_queue_overflow".into() }));
+        assert!(h.outputs.recv().await.is_none());
+    }
+
+    #[test]
+    fn rtp_control_queue_overflow_closes_playout_and_cancels_attachment() {
+        let playout = Arc::new(parking_lot::Mutex::new(Playout::new(20)));
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        tx.try_send(MediaEvent::FlowControl { level: "high_water", buffered_ms:20 }).unwrap();
+        playout.lock().push_pcm(1, tone(9, 320), &mut Vec::new());
+        let mut source = VboxPlayoutSource::new(playout.clone(), tx, cancel.clone());
+        let mut pcm = [0;320];
+        source.read_samples(&mut pcm); // low_water cannot fit in the full channel
+        assert!(playout.lock().is_closed());
+        assert!(cancel.is_cancelled());
+        assert!(matches!(rx.try_recv(), Ok(MediaEvent::FlowControl { level: "high_water", .. })));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(source.read_samples(&mut pcm), 0);
+    }
+
 }

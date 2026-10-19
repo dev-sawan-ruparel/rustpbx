@@ -68,6 +68,7 @@ pub struct Binding {
     media_requested: Option<String>,
     active_media: Option<ActiveMedia>,
     pending_transfer: Option<(String, String)>,
+    transfer_timeout_ms: Option<u64>,
     terminal_hint: Option<&'static str>,
     terminal_reason: Option<String>,
 }
@@ -480,6 +481,7 @@ impl VboxControl {
                 media_requested: None,
                 active_media: None,
                 pending_transfer: None,
+                transfer_timeout_ms: None,
                 terminal_hint: None,
                 terminal_reason: None,
             },
@@ -523,6 +525,7 @@ impl VboxControl {
                 media_requested: None,
                 active_media: None,
                 pending_transfer: None,
+                transfer_timeout_ms: None,
                 terminal_hint: None,
                 terminal_reason: None,
             },
@@ -538,16 +541,33 @@ impl VboxControl {
         }
     }
 
-    pub fn set_pending_transfer(&self, pbx_call_id: &str, command_id: &str, target: &str) -> bool {
+    pub fn set_pending_transfer(&self, pbx_call_id: &str, command_id: &str, target: &str, timeout_ms: u64) -> bool {
         let mut inner = self.inner.lock();
         match inner.bindings.get_mut(pbx_call_id) {
             Some(b) => {
                 b.pending_transfer = Some((command_id.to_string(), target.to_string()));
+                b.transfer_timeout_ms = Some(timeout_ms);
                 b.state = "transferring";
                 true
             }
             None => false,
         }
+    }
+
+    /// True while a contract `transfer` for this call awaits its outcome.
+    pub fn transfer_pending(&self, pbx_call_id: &str) -> bool {
+        self.inner
+            .lock()
+            .bindings
+            .get(pbx_call_id)
+            .is_some_and(|b| b.pending_transfer.is_some())
+    }
+
+    pub fn transfer_timeout_ms(&self, pbx_call_id: &str) -> Option<u64> {
+        let inner = self.inner.lock();
+        let binding = inner.bindings.get(pbx_call_id)?;
+        binding.pending_transfer.as_ref()?;
+        binding.transfer_timeout_ms
     }
 
     pub fn clear_pending_transfer(&self, pbx_call_id: &str) {
@@ -721,6 +741,7 @@ impl VboxControl {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 v["direction"] = json!("inbound");
+                v["provider_connection_id"] = json!(self.config.read().provider_connection_id);
                 Self::emit_locked(&inner, v);
                 None
             }

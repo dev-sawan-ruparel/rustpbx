@@ -42,6 +42,7 @@ pub mod user_db;
 pub mod user_extension;
 pub mod user_http;
 pub mod user_plain;
+pub mod via_transport;
 pub mod ws;
 
 #[derive(Debug)]

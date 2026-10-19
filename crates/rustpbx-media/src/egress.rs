@@ -485,7 +485,18 @@ impl EgressTask {
                         let clear_marker = self.marker_pending;
                         let stamp_ts = frame.rtp_timestamp;
                         let stamp_seq = frame.sequence_number;
+                        if let EgressSource::Media { audio, .. } = &mut self.source {
+                            if frame.data.is_empty() {
+                                audio.rtp_enqueue_failed();
+                                self.rollback_unsent_timeline(stamp_ts, stamp_seq);
+                                continue;
+                            }
+                            audio.prepare_rtp(stamp_ts);
+                        }
                         if self.sender.try_send(MediaSample::Audio(frame)).is_err() {
+                            if let EgressSource::Media { audio, .. } = &mut self.source {
+                                audio.rtp_enqueue_failed();
+                            }
                             // Frame never reached the packetizer. Roll back the
                             // paced timeline so we do not leave a seq/ts hole —
                             // Chrome treats those as loss and PLC clicks (app

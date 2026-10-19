@@ -42,6 +42,7 @@ async fn test_inbound_refer_success() {
     let mut users = crate::common::test_helpers::standard_test_users();
     for user in &mut users { user.is_support_webrtc = false; }
     let server = Arc::new(E2eTestServer::start_with_inject(config, E2eTestServerInject {
+                transaction_modules: Vec::new(),
             bans: None,
                 queue_enricher: None,
         users, ..Default::default()
@@ -435,6 +436,7 @@ async fn test_inbound_refer_to_queue_route() {
         E2eTestServer::start_with_inject(
             config,
             E2eTestServerInject {
+                transaction_modules: Vec::new(),
             bans: None,
                 queue_enricher: None,
                 users: vec![
@@ -691,6 +693,7 @@ async fn test_inbound_refer_rejection_recovery_and_transferor_bye() {
         let gateway = rustpbx::rwi::gateway::RwiGateway::new();
         let mut rwi_events = gateway.subscribe_events();
         let server = E2eTestServer::start_with_inject(config, E2eTestServerInject {
+                transaction_modules: Vec::new(),
             bans: None,
             users, rwi_gateway: Some(Arc::new(parking_lot::RwLock::new(gateway))), ..Default::default()
         }).await.unwrap();
@@ -879,6 +882,7 @@ action = { type = "transfer", target = "charlie" }
     let mut users = crate::common::test_helpers::standard_test_users();
     for user in &mut users { user.is_support_webrtc = false; }
     let server = Arc::new(E2eTestServer::start_with_inject(config, E2eTestServerInject {
+                transaction_modules: Vec::new(),
             bans: None,
         users, ..Default::default()
     }).await.unwrap());
@@ -1039,6 +1043,7 @@ async fn test_inbound_refer_known_unregistered_user() {
     let mut users = crate::common::test_helpers::standard_test_users();
     for user in &mut users { user.is_support_webrtc = false; }
     let server = Arc::new(E2eTestServer::start_with_inject(config, E2eTestServerInject {
+                transaction_modules: Vec::new(),
             bans: None,
         users, ..Default::default()
     }).await.unwrap());

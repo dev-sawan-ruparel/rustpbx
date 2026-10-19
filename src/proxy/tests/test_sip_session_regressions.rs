@@ -969,7 +969,7 @@ async fn bridge_rtp_dtmf_reaches_return_app_once_without_stale_app_injection() {
     session.app_runtime = runtime.clone();
 
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
-    *session.bridge_dtmf_tx.write() = Some(bridge_tx);
+    *session.bridge_dtmf_tx.write() = Some(bridge_tx.into());
     session.meta.transfer_return_app = Some(ReturnAppSpec {
         app_name: "ivr".to_string(),
         params: serde_json::json!({"file": "main-menu"}),

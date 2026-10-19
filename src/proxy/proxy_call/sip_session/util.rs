@@ -245,6 +245,27 @@ pub(super) async fn trace_sip_headers(
 ///    For a RESUMABLE hand-off (`return_ivr_resume=1`) the eager per-digit
 ///    trace is suppressed (the resumed executor reports the bridge step with
 ///    `next_node_id`); the buffered digit still reaches the provider.
+/// Keep the original bridge path compatible while vbox attachments have a
+/// bounded, fail-closed ingress queue. No digit audit buffer is needed for vbox.
+#[derive(Clone)]
+pub enum BridgeDtmfSender {
+    Legacy(tokio::sync::mpsc::UnboundedSender<String>),
+    Vbox { sender: tokio::sync::mpsc::Sender<String>, cancel: tokio_util::sync::CancellationToken },
+}
+impl From<tokio::sync::mpsc::UnboundedSender<String>> for BridgeDtmfSender {
+    fn from(sender: tokio::sync::mpsc::UnboundedSender<String>) -> Self { Self::Legacy(sender) }
+}
+impl BridgeDtmfSender {
+    pub fn send(&self, value: String) {
+        match self {
+            Self::Legacy(sender) => { let _ = sender.send(value); }
+            Self::Vbox { sender, cancel } => {
+                if sender.try_send(value).is_err() { cancel.cancel(); }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn forward_dtmf_event(
     digit: char,
@@ -252,7 +273,7 @@ pub(super) fn forward_dtmf_event(
     session_id: &str,
     app_runtime: &Arc<dyn AppRuntime>,
     rwi_gateway: &Option<crate::rwi::RwiGatewayRef>,
-    bridge_dtmf_tx: &Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    bridge_dtmf_tx: &Arc<parking_lot::RwLock<Option<BridgeDtmfSender>>>,
     bridge_trace_context: &parking_lot::Mutex<Option<super::transfer::BridgeTraceContext>>,
     bridge_dtmf_digits: &parking_lot::Mutex<Vec<String>>,
     caller: &str,
@@ -275,7 +296,10 @@ pub(super) fn forward_dtmf_event(
             })
             .to_string(),
         );
-        // Bridge active: buffer + report.
+        // vbox owns its event history; do not accumulate a second unbounded
+        // digit buffer in the upstream generic IVR bridge path.
+        if matches!(tx, BridgeDtmfSender::Vbox { .. }) { return true; }
+        // Generic bridge active: preserve existing buffer + report behavior.
         bridge_dtmf_digits.lock().push(digit_str.clone());
         let ctx = bridge_trace_context.lock().clone();
         if let Some(gw) = rwi_gateway.as_ref()

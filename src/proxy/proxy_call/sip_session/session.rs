@@ -15,6 +15,39 @@ const CMD_CHANNEL_CAPACITY: usize = 256;
 const RUSTPBX_COMMAND_CT: &str = "application/vnd.rustpbx+json";
 
 /// Merge routed application parameters with caller-provided Step-IVR variables.
+/// Keep a record-routed UAS dialog's remote target equal to the INVITE's
+/// Contact.
+///
+/// rsipstack appends `;transport=<tcp|tls>` to a UAS dialog's remote target
+/// when the INVITE arrived over a reliable transport (`DialogLayer::
+/// get_or_create_server_invite`). With a Record-Route set, in-dialog requests
+/// go to the first route and the Contact is only the Request-URI the last
+/// proxy forwards to (RFC 3261 §12.1.1, §12.2.1.1): it must be sent exactly as
+/// received. Telnyx's inbound INVITE carries `Contact:
+/// <sip:mod_sofia@10.239.42.224:6000>` behind its record-routing TLS proxy;
+/// the BYE went out as `BYE sip:mod_sofia@10.239.42.224:6000;transport=TLS`,
+/// the proxy tried TLS to its internal UDP media server and answered 408, and
+/// the caller stayed up (live, 2026-10-19).
+pub(crate) fn restore_record_routed_remote_target(
+    dialog: &rsipstack::dialog::invite_dialog::InviteDialog,
+    invite: &rsipstack::sip::Request,
+) {
+    use rsipstack::sip::{Header, ToTypedHeader};
+    if !invite.headers.iter().any(|h| matches!(h, Header::RecordRoute(_))) {
+        return;
+    }
+    let Some(contact) = invite.headers.iter().find_map(|h| match h {
+        Header::Contact(c) => Some(c.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+    let Ok(typed) = contact.clone().typed() else {
+        return;
+    };
+    rsipstack::dialog::dialog::Dialog::Invite(dialog.clone()).set_remote_target(typed.uri, Some(contact));
+}
+
 fn merge_ivr_exec_app_params(
     base_params: Option<serde_json::Value>,
     ivr_params: Option<serde_json::Value>,
@@ -175,7 +208,7 @@ pub struct SipSession {
     /// active bridge WebSocket. Set by `connect_bridge()`, cleared when the
     /// bridge ends. SIP INFO DTMF is also forwarded through this channel.
     pub bridge_dtmf_tx:
-        Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+        Arc<parking_lot::RwLock<Option<super::util::BridgeDtmfSender>>>,
 
     /// Originating IVR node context of the active bridge (step_id / extra).
     /// Armed by `connect_bridge()` from `_rst_*` URI params injected by the
@@ -1581,6 +1614,7 @@ impl SipSession {
             .dialog_layer
             .get_or_create_server_invite(tx, state_tx, None, local_contact.clone())
             .map_err(|e| anyhow!("Failed to create server dialog: {}", e))?;
+        restore_record_routed_remote_target(&server_dialog, &tx.original);
 
         let initial_plan = Self::initial_plan(&server, &context);
         let use_media_proxy = Self::check_media_proxy(&context, &initial_plan.media.proxy_mode);
@@ -13290,6 +13324,25 @@ impl SipSession {
             );
         }
 
+        // Honor an explicit failure response before generic hangup turns an
+        // unanswered UAS dialog into 487. Confirmed calls still use BYE.
+        let caller_id = LegId::from("caller");
+        let ends_caller = match cascade {
+            HangupCascade::All | HangupCascade::Other => true,
+            HangupCascade::None => false,
+            HangupCascade::AllExcept(exclude) => !exclude.contains(&caller_id),
+        };
+        if ends_caller
+            && let Some(code) = cmd.code.filter(|code| (300..=699).contains(code))
+            && let Some(dialog) = self.caller_dialog.as_ref()
+            && !dialog.state().is_confirmed()
+            && !dialog.state().is_terminated()
+        {
+            if let Err(error) = dialog.reject(Some(StatusCode::from(code)), None) {
+                return CommandResult::failure(format!("Failed to reject caller: {error}"));
+            }
+        }
+
         let mut ended_legs: Vec<LegId> = Vec::new();
         for leg in self.legs.values_mut() {
             let should_hangup = match cascade {
@@ -14106,7 +14159,12 @@ impl SipSession {
             .ok_or_else(|| anyhow!("No command sender available"))?;
         let cancel_token = self.cancel_token.child_token();
 
-        let ring_timeout = Self::effective_ring_timeout(&self.context.dialplan, &self.server);
+        let transfer_timeout = self.pending_refers.contains_key(leg_id)
+            .then(|| self.vbox_control().and_then(|control|
+                control.transfer_timeout_ms(&self.context.session_id)))
+            .flatten().map(Duration::from_millis);
+        let ring_timeout = transfer_timeout.or_else(||
+            Self::effective_ring_timeout(&self.context.dialplan, &self.server));
 
         // Spawn background task to handle INVITE response
         let invite_handle = crate::utils::spawn(async move {
@@ -14116,6 +14174,7 @@ impl SipSession {
 
             let mut result: Result<InviteDialog, String> = Err("not started".to_string());
             let mut answered_guard = None;
+            let mut invite_dialog_id = None;
             let mut state_rx_open = true;
             let deadline = tokio::time::sleep(ring_timeout.unwrap_or(Duration::from_secs(60)));
             tokio::pin!(deadline);
@@ -14125,9 +14184,30 @@ impl SipSession {
                     biased;
                     _ = cancel_token.cancelled() => break,
                     _ = &mut deadline, if ring_timeout.is_some() => {
-                        let _ = cmd_tx.send(CallCommand::LegFailed {
-                            leg_id: leg_id.clone(), reason: "Ring timeout".to_string(),
-                        }).await;
+                        if transfer_timeout.is_some() {
+                            // Cancel and drive the SAME INVITE to a final non-2xx.
+                            // Dropping its future merely schedules asynchronous cleanup;
+                            // a CANCEL ACK or crossed 2xx is not authoritative failure.
+                            let cleanup = async {
+                                let id = invite_dialog_id.as_ref()?;
+                                let Some(rsipstack::dialog::dialog::Dialog::Invite(dialog)) = dialog_layer.get_dialog(id) else { return None; };
+                                dialog.cancel().await.ok()?;
+                                let (_, response) = (&mut invitation).await.ok()?;
+                                let response = response?;
+                                (response.status_code.code() >= 300).then_some(())
+                            };
+                            if matches!(tokio::time::timeout(Duration::from_millis(750), cleanup).await, Ok(Some(()))) {
+                                let _ = cmd_tx.send(CallCommand::LegFailed {
+                                    leg_id: leg_id.clone(), reason: "Rejected with 408 (transfer deadline; cancellation confirmed)".into(),
+                                }).await;
+                            } else {
+                                warn!(session_id = %session_id, %leg_id, "Transfer cancellation outcome uncertain; no authoritative failure emitted");
+                            }
+                        } else {
+                            let _ = cmd_tx.send(CallCommand::LegFailed {
+                                leg_id: leg_id.clone(), reason: "Ring timeout".to_string(),
+                            }).await;
+                        }
                         break;
                     }
                     r = &mut invitation, if !result.is_ok() => {
@@ -14213,6 +14293,12 @@ impl SipSession {
                         }
                     }
                     state = state_rx.recv(), if state_rx_open => {
+                        // do_invite registers the initial Calling ID; provisional
+                        // responses may change the dialog's remote tag without
+                        // changing that registry key until final response.
+                        if invite_dialog_id.is_none() {
+                            if let Some(ref update) = state { invite_dialog_id = Some(update.id().clone()); }
+                        }
                         match state {
                             Some(rsipstack::dialog::dialog::DialogState::Early(_, ref resp)) => {
                                 let body = resp.body();

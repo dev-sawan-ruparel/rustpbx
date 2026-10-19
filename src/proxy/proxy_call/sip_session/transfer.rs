@@ -842,6 +842,32 @@ impl SipSession {
         callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
         headers: HashMap<String, String>,
     ) -> Result<()> {
+        // A vbox contract `transfer` must bridge the caller to a new target
+        // leg. A target that resolves to an application or route point on the
+        // caller's own session (e.g. a DID whose inbound route is `app =
+        // "rwi"`) bridges nobody: refuse it before anything changes, so the
+        // caller stays with the attached vbox agent and vbox gets
+        // `transfer_failed` instead of a false `transfer_completed` (live
+        // 2026-10-19: the rwi app restarted on the caller's session, the
+        // agent's media closed "transferred", and the caller sat in silence).
+        let parsed = parse_transfer_target(&target);
+        if !matches!(parsed, TransferTarget::Sip { .. })
+            && self
+                .vbox_control()
+                .is_some_and(|control| control.transfer_pending(&self.context.session_id))
+        {
+            let kind = transfer_target_type_str(&parsed).unwrap_or("application").to_string();
+            warn!(session_id = %self.id, %leg_id, %target, %kind, "vbox transfer target resolves to an application; refusing (no leg to bridge)");
+            self.emit_typed_rwi_event(&crate::rwi::CallTransferFailed {
+                call_id: self.context.session_id.clone(),
+                sip_status: None,
+                reason: Some("target_resolved_to_application".to_string()),
+                transfer_target: Some(target.clone()),
+                transfer_target_type: Some(kind),
+            });
+            return Err(anyhow!("transfer target {target} resolves to an application; no leg to bridge"));
+        }
+
         self.meta.transfer_in_progress = true;
         self.sync_rtp_timeout_pause();
 
@@ -2618,7 +2644,7 @@ impl SipSession {
 
         // ── 5. DTMF JSON text-frame channel ─────────────────────────
         let (dtmf_json_tx, mut dtmf_json_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        *self.bridge_dtmf_tx.write() = Some(dtmf_json_tx.clone());
+        *self.bridge_dtmf_tx.write() = Some(dtmf_json_tx.clone().into());
         let bridge_dtmf_tx_state = self.bridge_dtmf_tx.clone();
 
         let cmd_tx_for_fwd = self.cmd_tx.clone();

@@ -25,6 +25,8 @@ pub struct E2eTestServerInject {
     /// REPLACE the standard alice/bob/charlie users (useful when tests need
     /// their own caller/agent identities with distinct ids).
     pub users: Vec<SipUser>,
+    /// Explicit test-only transaction module injection; never compiled into production setup.
+    pub transaction_modules: Vec<(String, rustpbx::proxy::FnCreateProxyModule)>,
     /// Session hook installed via `with_session_hook`.
     pub session_hook: Option<Arc<dyn CallSessionHook>>,
     /// App-level agent registry installed after the standard modules
@@ -52,6 +54,7 @@ impl Default for E2eTestServerInject {
     fn default() -> Self {
         Self {
             users: Vec::new(),
+            transaction_modules: Vec::new(),
             session_hook: None,
             agent_registry: None,
             rwi_gateway: None,
@@ -231,11 +234,15 @@ impl E2eTestServer {
             let base = test_helpers::test_proxy_config(port);
             config.addr = base.addr;
             config.udp_port = base.udp_port;
-            config.tcp_port = base.tcp_port;
+            // A caller asking for TCP (any `tcp_port`) gets it on the picked port.
+            config.tcp_port = proxy_config.tcp_port.map(|_| port).or(base.tcp_port);
             config.tls_port = base.tls_port;
             config.ws_port = base.ws_port;
             config.useragent = base.useragent;
             config.modules = base.modules;
+            for (name, _) in &inject.transaction_modules {
+                config.modules.get_or_insert_with(Vec::new).insert(0, name.clone());
+            }
             config.ensure_user = Some(false);
             // Latching: keep the caller's value (ProxyConfig::default() is
             // enabled; constructors that need it off set it explicitly
@@ -243,7 +250,10 @@ impl E2eTestServer {
 
             let mode = config.media_proxy;
             let (builder, cdr_capture, cancel_token) = Self::base_builder(config, &inject).await?;
-            let builder = test_helpers::register_standard_modules(builder);
+            let mut builder = test_helpers::register_standard_modules(builder);
+            for (name, factory) in &inject.transaction_modules {
+                builder = builder.register_module(name, *factory);
+            }
             #[allow(unused_mut)]
             let mut builder = match &inject.agent_registry {
                 Some(registry) => builder.with_agent_registry(registry.clone()),

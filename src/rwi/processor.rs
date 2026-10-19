@@ -1434,6 +1434,7 @@ impl RwiCommandProcessor {
             // (Paths that never assign read the initial `None`.)
             #[allow(unused_assignments)]
             let mut setup_end_reason: Option<CallRecordHangupReason> = None;
+            let mut setup_terminal: Option<(&'static str, Option<u16>)> = None;
 
             // Wait for the outbound INVITE to complete while servicing the
             // commands that are meaningful before the first dialog is
@@ -1852,10 +1853,12 @@ impl RwiCommandProcessor {
                         {
                             let gw = gateway.read();
                             if sip_status == Some(486) || sip_status == Some(600) {
+                                setup_terminal = Some(("busy", sip_status));
                                 gw.send_to_owner(&crate::rwi::CallBusy {
                                     call_id: call_id.clone(),
                                 });
                             } else if matches!(sip_status, Some(408) | Some(480) | Some(487)) {
+                                setup_terminal = Some(("no_answer", sip_status));
                                 gw.send_to_owner(&crate::rwi::CallNoAnswer {
                                     call_id: call_id.clone(),
                                 });
@@ -1900,6 +1903,7 @@ impl RwiCommandProcessor {
                     Err(_) => {
                         // Ring timeout — the customer leg never answered.
                         setup_end_reason = Some(CallRecordHangupReason::NoAnswer);
+                        setup_terminal = Some(("no_answer", None));
                         let gw = gateway.read();
                         gw.send_to_owner(&crate::rwi::CallNoAnswer {
                             call_id: call_id.clone(),
@@ -1916,6 +1920,20 @@ impl RwiCommandProcessor {
             session
                 .fire_on_call_ended_hooks(setup_end_reason.as_ref(), 0)
                 .await;
+
+            // Busy/no-answer are progress hints, not terminal events. There is
+            // no UAC session loop on failed setup to emit its normal shutdown
+            // event. Confirm this session ended before cleanup disowns it.
+            if let Some((reason, sip_status)) = setup_terminal {
+                gateway.read().send_to_owner(&crate::rwi::CallHangup {
+                    leg_id: None,
+                    call_id: call_id.clone(),
+                    reason: Some(reason.to_string()),
+                    hangup_by: None,
+                    sip_status,
+                    duration_secs: None,
+                });
+            }
 
             // Failed setup (rejected / no-answer / timeout): the ringback
             // recording is the artifact to KEEP — clear its provisional

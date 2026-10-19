@@ -102,7 +102,7 @@ fn native_error(control: &VboxControl, env: &Envelope, code: &str, err: CommandE
 /// `/ws/rustpbx/<call_id>` with an optional query: the only media target a
 /// command may name. The host always comes from configuration.
 fn valid_media_path(path: &str, call_id: &str) -> bool {
-    let prefix = format!("/ws/rustpbx/{call_id}");
+    let prefix = format!("/ws/rustpbx/{}", urlencoding::encode(call_id));
     match path.strip_prefix(&prefix) {
         Some(rest) => rest.is_empty() || rest.starts_with('?'),
         None => false,
@@ -378,6 +378,11 @@ async fn hangup(control: &VboxControl, env: &Envelope<'_>, ctx: &ContractContext
     }
 }
 
+/// Transfer target ring limit bounds (`max_ring_secs` / `transfer_timeout_ms`).
+pub(crate) const MIN_TRANSFER_RING_MS: u64 = 1_000;
+pub(crate) const MAX_TRANSFER_RING_MS: u64 = 120_000;
+pub(crate) const DEFAULT_TRANSFER_RING_MS: u64 = 30_000;
+
 async fn transfer(control: &VboxControl, env: &Envelope<'_>, ctx: &ContractContext<'_>) -> ContractReply {
     let Some(pbx_call_id) = resolve_pbx_call_id(control, env) else {
         return ContractReply::only(error(control, env.command_id, env.operation, "call_not_found", "unknown call"));
@@ -385,7 +390,23 @@ async fn transfer(control: &VboxControl, env: &Envelope<'_>, ctx: &ContractConte
     let Some(target) = env.field("target") else {
         return ContractReply::only(error(control, env.command_id, env.operation, "missing_required_field", "target is required"));
     };
-    if !control.set_pending_transfer(&pbx_call_id, env.command_id, target) {
+    // How long the target may ring: vbox's per-target `max_ring_secs`, else
+    // the legacy `transfer_timeout_ms`; clamped to 1-120 s, 30 s when absent.
+    // A real phone needs well over the former 4 s cap to answer.
+    let timeout_ms = match (env.payload.get("max_ring_secs"), env.payload.get("transfer_timeout_ms")) {
+        (Some(value), _) => match value.as_u64() {
+            Some(secs) => secs.clamp(MIN_TRANSFER_RING_MS / 1000, MAX_TRANSFER_RING_MS / 1000) * 1000,
+            None => return ContractReply::only(error(control, env.command_id, env.operation,
+                "invalid_max_ring_secs", "max_ring_secs must be a non-negative integer")),
+        },
+        (None, Some(value)) => match value.as_u64() {
+            Some(ms) => ms.clamp(MIN_TRANSFER_RING_MS, MAX_TRANSFER_RING_MS),
+            None => return ContractReply::only(error(control, env.command_id, env.operation,
+                "invalid_transfer_timeout", "transfer_timeout_ms must be a non-negative integer")),
+        },
+        (None, None) => DEFAULT_TRANSFER_RING_MS,
+    };
+    if !control.set_pending_transfer(&pbx_call_id, env.command_id, target, timeout_ms) {
         return ContractReply::only(error(control, env.command_id, env.operation, "call_not_owned", pbx_call_id));
     }
     match ctx
@@ -488,6 +509,7 @@ mod tests {
     #[test]
     fn media_path_must_name_the_bound_call() {
         assert!(valid_media_path("/ws/rustpbx/call-1", "call-1"));
+        assert!(valid_media_path("/ws/rustpbx/a%2Fb%20c%3F?token=x", "a/b c?"));
         assert!(valid_media_path("/ws/rustpbx/call-1?token=abc", "call-1"));
         assert!(!valid_media_path("/ws/rustpbx/call-10?token=abc", "call-1"));
         assert!(!valid_media_path("wss://evil.example/ws/rustpbx/call-1", "call-1"));

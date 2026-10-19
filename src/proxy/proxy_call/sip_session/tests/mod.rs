@@ -843,7 +843,7 @@ fn forward_dtmf_rejects_non_caller_leg_as_application_input() {
     });
     let app_runtime: Arc<dyn AppRuntime> = runtime.clone();
     let (tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let bridge_dtmf_tx = Arc::new(parking_lot::RwLock::new(Some(tx)));
+    let bridge_dtmf_tx = Arc::new(parking_lot::RwLock::new(Some(tx.into())));
     let buffered = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
     let accepted = forward_dtmf_event(
@@ -886,7 +886,7 @@ fn forward_dtmf_with_active_bridge_owns_digit_without_app_injection() {
 
     // Bridge active: an open channel counts as "bridge running".
     let (tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let bridge_dtmf_tx = Arc::new(parking_lot::RwLock::new(Some(tx)));
+    let bridge_dtmf_tx = Arc::new(parking_lot::RwLock::new(Some(tx.into())));
 
     let trace_ctx = Arc::new(parking_lot::Mutex::new(Some(BridgeTraceContext {
         step_id: Some("step-menu-tts".to_string()),
@@ -997,7 +997,7 @@ fn forward_dtmf_resumable_bridge_defers_trace_to_resumed_ivr() {
     let gw_ref = Arc::new(parking_lot::RwLock::new(gateway));
 
     let (tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let bridge_dtmf_tx = Arc::new(parking_lot::RwLock::new(Some(tx)));
+    let bridge_dtmf_tx = Arc::new(parking_lot::RwLock::new(Some(tx.into())));
 
     let trace_ctx = Arc::new(parking_lot::Mutex::new(Some(BridgeTraceContext {
         step_id: Some("step-menu-tts".to_string()),
@@ -8924,4 +8924,27 @@ async fn test_leg_agent_id_uses_the_legs_own_agent() {
         Some("bob"),
         "an unknown leg falls back to the session-level agent"
     );
+}
+
+#[test]
+fn vbox_dtmf_ingress_overflow_cancels_attachment_without_unbounded_audit_buffer() {
+    let runtime = Arc::new(DtmfAppRuntime { running: true, inject_calls: AtomicUsize::new(0) });
+    let app_runtime: Arc<dyn AppRuntime> = runtime.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let bridge = Arc::new(parking_lot::RwLock::new(Some(crate::proxy::proxy_call::sip_session::util::BridgeDtmfSender::Vbox {
+        sender: tx, cancel: cancel.clone(),
+    })));
+    let trace = parking_lot::Mutex::new(None);
+    let digits = parking_lot::Mutex::new(Vec::new());
+    for digit in ['1', '2'] {
+        assert!(forward_dtmf_event(digit, "caller", "bounded-vbox", &app_runtime, &None,
+            &bridge, &trace, &digits, "sip:a@x", "sip:b@x", None));
+    }
+    assert!(cancel.is_cancelled(), "full DTMF ingress must terminate the attachment");
+    assert!(digits.lock().is_empty(), "vbox must not populate the generic unbounded IVR audit Vec");
+    let first: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+    assert_eq!(first["digit"], "1");
+    assert!(rx.try_recv().is_err());
+    assert_eq!(runtime.inject_calls.load(Ordering::SeqCst), 0);
 }

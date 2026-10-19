@@ -65,6 +65,18 @@ impl Drop for Harness {
 }
 
 async fn harness(orphan_hold_secs: u64) -> Harness {
+    harness_with_modules(orphan_hold_secs, Vec::new()).await
+}
+async fn harness_with_modules(orphan_hold_secs: u64, transaction_modules: Vec<(String, rustpbx::proxy::FnCreateProxyModule)>) -> Harness {
+    harness_with(orphan_hold_secs, transaction_modules, false).await
+}
+/// `carrier`: also listen on SIP/TCP and treat 127.0.0.1 as a trunk (no
+/// digest auth), so a raw SIP carrier can call in like Telnyx does.
+async fn harness_with(
+    orphan_hold_secs: u64,
+    transaction_modules: Vec<(String, rustpbx::proxy::FnCreateProxyModule)>,
+    carrier: bool,
+) -> Harness {
     let _ = tracing_subscriber::fmt::try_init();
     // Fake vbox media endpoint: records the request path of each socket.
     let media_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -101,7 +113,7 @@ async fn harness(orphan_hold_secs: u64) -> Harness {
         ..Default::default()
     });
 
-    let config = ProxyConfig {
+    let mut config = ProxyConfig {
         media_proxy: MediaProxyMode::All,
         routes: Some(vec![RouteRule {
             name: "vbox_inbound".to_string(),
@@ -120,10 +132,22 @@ async fn harness(orphan_hold_secs: u64) -> Harness {
         }]),
         ..Default::default()
     };
+    if carrier {
+        config.tcp_port = Some(0);
+        config.trunks.insert(
+            "carrier".to_string(),
+            rustpbx::proxy::routing::TrunkConfig {
+                dest: "sip:127.0.0.1:5060".to_string(),
+                inbound_hosts: vec!["127.0.0.1".to_string()],
+                ..Default::default()
+            },
+        );
+    }
     let server = E2eTestServer::start_with_inject(
         config,
         E2eTestServerInject {
             rwi_gateway: Some(gateway.clone()),
+            transaction_modules,
             ..Default::default()
         },
     )
@@ -890,6 +914,203 @@ async fn vbox_contract_inbound_hangup_byes_the_caller() {
     }
 }
 
+// ── Raw SIP/TCP carrier (Telnyx-shaped inbound leg) ───────────────────────
+
+/// One SIP message (head + body) from a stream connection.
+async fn read_sip(stream: &mut TcpStream, buf: &mut Vec<u8>, timeout: Duration) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Skip CRLF keep-alives.
+        while buf.starts_with(b"\r\n") {
+            buf.drain(..2);
+        }
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    (k.eq_ignore_ascii_case("content-length") || k == "l").then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                let msg = String::from_utf8_lossy(&buf[..end + 4 + len]).to_string();
+                buf.drain(..end + 4 + len);
+                return Some(msg);
+            }
+        }
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let mut chunk = [0u8; 8192];
+        match tokio::time::timeout(left, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => return None,
+        }
+    }
+}
+
+fn sip_header<'a>(msg: &'a str, name: &str) -> Option<&'a str> {
+    msg.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+async fn send_sip(stream: &mut TcpStream, msg: &str) {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(msg.as_bytes()).await.unwrap();
+}
+
+/// Inbound call from a record-routing carrier proxy over a reliable
+/// transport, shaped like Telnyx's 2026-10-19 INVITE: two Record-Route
+/// entries (the proxy's own address first) and a Contact without a transport
+/// parameter naming the carrier's internal media server. The agent hangs up
+/// with contract `hangup`; the BYE must go to the first route with the
+/// Contact unchanged as Request-URI and a Via naming the transport it is
+/// sent on (RFC 3261 §12.2.1.1, §18.1.1). Live, the BYE was
+/// `BYE sip:mod_sofia@…:6000;transport=TLS` with `Via: SIP/2.0/UDP …:5060`;
+/// Telnyx's proxy tried TLS to its UDP media server, answered 408 and the
+/// caller stayed up.
+#[tokio::test]
+async fn vbox_contract_record_routed_inbound_hangup_bye_keeps_contact_and_via_transport() {
+    // `acl` identifies the trunk by source address (as in production).
+    let acl: (String, rustpbx::proxy::FnCreateProxyModule) = ("acl".to_string(), rustpbx::proxy::acl::AclModule::create);
+    let mut h = harness_with(30, vec![acl], true).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {"include_terminated_since": 0}})).await;
+
+    // The carrier proxy listens where its Record-Route points.
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = proxy.local_addr().unwrap().port();
+    let pbx_port = h.server.port;
+    let rtp = CallerRtp::bind().await;
+    let sdp = make_sdp(rtp.port());
+    let call_id = format!("carrier-{}", uuid::Uuid::new_v4().simple());
+    let contact = "<sip:mod_sofia@10.239.42.224:6000>";
+    let mut conn = TcpStream::connect(("127.0.0.1", pbx_port)).await.expect("PBX SIP/TCP");
+    let invite = format!(
+        "INVITE sip:{VBOX_DID}@127.0.0.1:{pbx_port} SIP/2.0\r\n\
+         Record-Route: <sip:127.0.0.1:{proxy_port};transport=tcp;r2=on;lr;ftag=ft1>\r\n\
+         Record-Route: <sip:10.255.0.1;r2=on;lr;ftag=ft1>\r\n\
+         Via: SIP/2.0/TCP 127.0.0.1:{proxy_port};branch=z9hG4bKinv{call_id}\r\n\
+         Max-Forwards: 69\r\n\
+         From: <sip:+15550100001@127.0.0.1>;tag=ft1\r\n\
+         To: <sip:{VBOX_DID}@127.0.0.1>\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: {contact}\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{sdp}",
+        sdp.len()
+    );
+    send_sip(&mut conn, &invite).await;
+
+    let offered = ctl.event("incoming_call", Duration::from_secs(5)).await;
+    let pbx_call_id = offered["pbx_call_id"].as_str().unwrap().to_string();
+    let vbox_call = "call-carrier";
+    let binding_id = "bind-carrier";
+    let claim = ctl
+        .command("claim_call", 1, json!({"call_id": vbox_call, "binding_id": binding_id, "payload": {"pbx_call_id": pbx_call_id}}))
+        .await;
+    assert_eq!(claim["type"], "command_ack", "{claim}");
+    let attach = ctl
+        .command(
+            "attach_media",
+            1,
+            json!({"call_id": vbox_call, "binding_id": binding_id, "payload": {
+                "pbx_call_id": pbx_call_id,
+                "media_session_id": "m-carrier",
+                "ws_url": format!("/ws/rustpbx/{vbox_call}?token=tok-carrier"),
+                "token": "tok-carrier",
+                "outbound_framing": "generation_u64_pcm16le",
+            }}),
+        )
+        .await;
+    assert_eq!(attach["type"], "command_ack", "{attach}");
+    let answer = ctl
+        .command("answer", 1, json!({"call_id": vbox_call, "binding_id": binding_id, "payload": {"pbx_call_id": pbx_call_id}}))
+        .await;
+    assert_eq!(answer["type"], "command_ack", "{answer}");
+
+    // 200 OK on the carrier's connection, then the carrier ACKs.
+    let mut buf = Vec::new();
+    let ok = loop {
+        let msg = read_sip(&mut conn, &mut buf, Duration::from_secs(5)).await.expect("final response to INVITE");
+        if msg.starts_with("SIP/2.0 200") {
+            break msg;
+        }
+        assert!(msg.starts_with("SIP/2.0 1"), "unexpected response: {msg}");
+    };
+    let to = sip_header(&ok, "To").expect("To").to_string();
+    let pbx_contact = sip_header(&ok, "Contact").expect("PBX Contact");
+    let pbx_target = pbx_contact.trim_start_matches('<').split('>').next().unwrap().to_string();
+    send_sip(
+        &mut conn,
+        &format!(
+            "ACK {pbx_target} SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 127.0.0.1:{proxy_port};branch=z9hG4bKack{call_id}\r\n\
+             Max-Forwards: 69\r\n\
+             From: <sip:+15550100001@127.0.0.1>;tag=ft1\r\n\
+             To: {to}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 ACK\r\n\
+             Content-Length: 0\r\n\r\n"
+        ),
+    )
+    .await;
+    ctl.event("answered", Duration::from_secs(5)).await;
+    let (_, mut media) = h.next_media().await;
+    media_text(&mut media, "start", Duration::from_secs(3)).await;
+    media
+        .send(Message::Text(json!({"type": "ready", "media_session_id": "m-carrier"}).to_string().into()))
+        .await
+        .unwrap();
+
+    let hangup = ctl
+        .command("hangup", 1, json!({"call_id": vbox_call, "payload": {"pbx_call_id": pbx_call_id, "reason": "agent_hangup"}}))
+        .await;
+    assert_eq!(hangup["type"], "command_ack", "{hangup}");
+
+    // The BYE reaches the first route (the carrier proxy), on whichever
+    // connection the PBX picks: a new one to the route or the inbound flow.
+    let mut route_conn = None;
+    let bye = tokio::select! {
+        accepted = proxy.accept() => {
+            let (mut s, _) = accepted.unwrap();
+            let mut b = Vec::new();
+            let msg = read_sip(&mut s, &mut b, Duration::from_secs(3)).await;
+            route_conn = Some(s);
+            msg
+        }
+        msg = read_sip(&mut conn, &mut buf, Duration::from_secs(3)) => msg,
+    };
+    let bye = bye.expect("carrier proxy received a BYE");
+    let bye_conn = route_conn.as_mut().unwrap_or(&mut conn);
+    let request_line = bye.lines().next().unwrap();
+    assert_eq!(
+        request_line, "BYE sip:mod_sofia@10.239.42.224:6000 SIP/2.0",
+        "BYE Request-URI must be the INVITE Contact unchanged:\n{bye}"
+    );
+    let via = sip_header(&bye, "Via").expect("Via");
+    assert!(
+        via.starts_with("SIP/2.0/TCP 127.0.0.1:"),
+        "BYE Via must name the transport it was sent on (TCP): {via}\n{bye}"
+    );
+    let routes: Vec<&str> = bye.lines().filter(|l| l.to_ascii_lowercase().starts_with("route:")).collect();
+    assert_eq!(routes.len(), 2, "{bye}");
+    assert!(routes[0].contains(&format!("127.0.0.1:{proxy_port}")), "{bye}");
+    let mut reply = String::from("SIP/2.0 200 OK\r\n");
+    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+        reply.push_str(&format!("{name}: {}\r\n", sip_header(&bye, name).unwrap()));
+    }
+    reply.push_str("Content-Length: 0\r\n\r\n");
+    send_sip(bye_conn, &reply).await;
+    let ended = ctl.event("call_ended", Duration::from_secs(5)).await;
+    assert_eq!(ended["call_id"], vbox_call);
+    rtp.cancel.cancel();
+    h.server.stop();
+}
+
 /// Outbound: originate with pre-assigned identity, early correlation,
 /// answer → media attach, duplicate command id never dials twice, hangup.
 #[tokio::test]
@@ -1094,6 +1315,15 @@ async fn vbox_contract_media_reattach_supersedes_the_old_socket() {
     assert_eq!(path, "/ws/rustpbx/call-re?token=tok-m-b");
     let start = media_text(&mut new, "start", Duration::from_secs(3)).await;
     assert_eq!(start["media_session_id"], "m-b");
+    // Deterministically deliver the old worker's delayed 4000 outcome after
+    // successor attachment. This exercises the real session command handler;
+    // subsequent SIP/RTP assertions prove it cannot tear down the successor.
+    h.server.registry.get_handle(&pbx_call_id).unwrap().send_command(
+        rustpbx::call::domain::CallCommand::VboxMediaClosed {
+            media_session_id: "m-a".into(),
+            outcome: rustpbx::call::vbox_media::MediaOutput::AgentHangup { reason: "delayed_old_4000".into() },
+        }
+    ).unwrap();
     // vbox resumes above its high-water generation and clears first.
     new.send(Message::Text(json!({"type":"clear","generation":5}).to_string().into())).await.unwrap();
     let cleared = media_text(&mut new, "cleared", Duration::from_secs(2)).await;
@@ -1204,4 +1434,310 @@ async fn vbox_contract_failed_transfer_keeps_the_agent_attached() {
     assert_eq!(snap["active_calls"][0]["state"], "answered");
     rtp.cancel.cancel();
     h.server.stop();
+}
+
+/// Cross-language milestone: the controller/media server is the real Erlang
+/// application, started by scripts/rustpbx_interop.py. No Rust RWI client or
+/// fake media server participates in these calls.
+#[tokio::test]
+#[ignore = "requires the external Erlang runtime and disposable PostgreSQL"]
+async fn vbox_erlang_interop() {
+    let dir = std::path::PathBuf::from(std::env::var("VBOX_INTEROP_DIR").expect("VBOX_INTEROP_DIR required"));
+    async fn wait_file(dir: &std::path::Path, name: &str) -> Value {
+        let until = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < until {
+            if let Ok(bytes) = std::fs::read(dir.join(name)) {
+                if let Ok(v) = serde_json::from_slice(&bytes) { return v; }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {name}");
+    }
+    let vbox = wait_file(&dir, "vbox.json").await;
+    let h = harness(30).await;
+    h.gateway.read().vbox.set_config(VboxContractConfig {
+        media_base_url: Some(vbox["media_base_url"].as_str().unwrap().into()),
+        pbx_instance_id: Some("pbx-e2e".into()),
+        provider_connection_id: Some("rustpbx-local".into()),
+        ..Default::default()
+    });
+    let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+    let bob = h.server.create_ua("bob").await.unwrap();
+    std::fs::write(dir.join("pbx.json"), json!({"rwi_url": h.rwi_url,
+        "callee": format!("sip:bob@127.0.0.1:{}", bob.local_port()), "token": TOKEN}).to_string()).unwrap();
+    wait_file(&dir, "ready.json").await;
+    let rtp = CallerRtp::bind().await;
+    let dialog = tokio::time::timeout(Duration::from_secs(30), alice.make_call(VBOX_DID, Some(make_sdp(rtp.port()))))
+        .await.expect("inbound answer timeout").expect("inbound established");
+    let sdp = alice.get_negotiated_answer_sdp(&dialog).await.unwrap();
+    rtp.send_tone(extract_media_endpoint(&sdp).unwrap(), CALLER_TONE_HZ, 20);
+    wait_file(&dir, "inbound-audio.json").await;
+    let inbound_frames = rtp.tone_frames(AGENT_TONE_HZ).len();
+    assert!(inbound_frames >= 40, "inbound caller received agent tone: {inbound_frames}");
+    std::fs::write(dir.join("inbound-capture.json"), json!({"tone_frames": inbound_frames}).to_string()).unwrap();
+    assert!(wait_for_ua_event(&alice, Duration::from_secs(15), |e| matches!(e, TestUaEvent::CallTerminated(_))).await.is_some(), "inbound BYE");
+    rtp.cancel.cancel();
+    std::fs::write(dir.join("inbound-ended.json"), "{}").unwrap();
+    let bob_rtp = CallerRtp::bind().await;
+    let incoming = wait_for_ua_event(&bob, Duration::from_secs(30), |e| matches!(e, TestUaEvent::IncomingCall(..))).await;
+    let Some(TestUaEvent::IncomingCall(dialog, offer)) = incoming else { panic!("outbound INVITE missing") };
+    let addr = extract_media_endpoint(offer.as_deref().unwrap()).unwrap();
+    bob.answer_call(&dialog, Some(make_sdp(bob_rtp.port()))).await.unwrap();
+    bob_rtp.send_tone(addr, CALLER_TONE_HZ, 20);
+    wait_file(&dir, "outbound-audio.json").await;
+    let outbound_frames = bob_rtp.tone_frames(AGENT_TONE_HZ).len();
+    assert!(outbound_frames >= 40, "outbound callee received agent tone: {outbound_frames}");
+    std::fs::write(dir.join("outbound-capture.json"), json!({"tone_frames": outbound_frames}).to_string()).unwrap();
+    assert!(wait_for_ua_event(&bob, Duration::from_secs(15), |e| matches!(e, TestUaEvent::CallTerminated(_))).await.is_some(), "outbound BYE");
+    bob_rtp.cancel.cancel();
+    std::fs::write(dir.join("outbound-ended.json"), "{}").unwrap();
+    if std::env::var("VBOX_INTEROP_BULK").as_deref() == Ok("1") {
+        real_faults::erlang_bulk(&h, &dir).await;
+    }
+    wait_file(&dir, "done.json").await;
+    h.server.stop();
+}
+
+#[path = "vbox_real_faults.rs"]
+mod real_faults;
+
+/// A real provisional SIP target never answers. Failure is authoritative only
+/// after CANCEL/final response; the original attachment still carries RTP.
+#[tokio::test]
+async fn vbox_contract_transfer_deadline_cancels_target_preserves_agent() {
+    let mut h = harness(30).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {}})).await;
+    let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+    let bob = h.server.create_ua("bob").await.unwrap();
+    let rtp = CallerRtp::bind().await;
+    let (pbx_call_id, _, _, mut media) =
+        establish_inbound(&mut h, &mut ctl, &alice, &rtp, 1, "call-x-timeout", "m-timeout").await;
+    let target = format!("sip:bob@127.0.0.1:{}", bob.local_port());
+    let started = Instant::now();
+    let xfer = ctl.command("transfer", 1, json!({"call_id":"call-x-timeout", "payload":{
+        "pbx_call_id":pbx_call_id,"target":target,"transfer_timeout_ms":500}})).await;
+    assert_eq!(xfer["type"], "command_ack", "{xfer}");
+    let incoming = wait_for_ua_event(&bob, Duration::from_secs(3), |e| matches!(e,TestUaEvent::IncomingCall(..))).await;
+    let Some(TestUaEvent::IncomingCall(dialog, _)) = incoming else { panic!("target not invited") };
+    bob.send_ringing(&dialog, None).await.unwrap();
+    let failed = ctl.event("command_error", Duration::from_secs(3)).await;
+    assert_eq!(failed["error_code"], "transfer_failed");
+    assert_eq!(failed["command_id"], xfer["command_id"]);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(wait_for_ua_event(&bob, Duration::from_secs(2), |e| matches!(e,TestUaEvent::CallTerminated(_))).await.is_some(), "target received actual CANCEL termination");
+    let before = rtp.tone_frames(AGENT_TONE_HZ).len();
+    send_agent_audio(&mut media, 11, AGENT_TONE_HZ, 50).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(rtp.tone_frames(AGENT_TONE_HZ).len() >= before + 40);
+    let snap = ctl.command("get_call",1,json!({"call_id":"call-x-timeout","payload":{}})).await;
+    assert_eq!(snap["active_calls"][0]["state"], "answered");
+    ctl.command("hangup",1,json!({"call_id":"call-x-timeout","payload":{"reason":"test_cleanup"}})).await;
+    assert!(wait_for_ua_event(&alice, Duration::from_secs(3), |e| matches!(e,TestUaEvent::CallTerminated(_))).await.is_some());
+    rtp.cancel.cancel(); h.server.stop();
+}
+
+fn transfer_peer_response(request: &str, status: &str, contact: SocketAddr, body: &str) -> String {
+    let mut response = format!("SIP/2.0 {status}\r\n");
+    for line in request.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue; };
+        if ["via", "from", "to", "call-id", "cseq"].contains(&name.to_ascii_lowercase().as_str()) {
+            let tag = if name.eq_ignore_ascii_case("to") && !value.contains(";tag=") { ";tag=late-transfer-target" } else { "" };
+            response.push_str(&format!("{name}:{value}{tag}\r\n"));
+        }
+    }
+    response.push_str(&format!("Contact: <sip:latepeer@{contact}>\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+    response
+}
+
+/// A wire 200 crosses the actual CANCEL. It must be ACKed/BYE'd, never
+/// published as LegConnected or mislabeled as authoritative transfer failure.
+#[tokio::test]
+async fn vbox_contract_transfer_deadline_crossed_200_cannot_bridge() {
+    let mut h = harness(30).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {}})).await;
+    let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+    let rtp = CallerRtp::bind().await;
+    let (_, _, _, mut media) = establish_inbound(&mut h, &mut ctl, &alice, &rtp, 1, "call-x-late", "m-late").await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = target.local_addr().unwrap();
+    let target_rtp = CallerRtp::bind().await;
+    let sdp = make_sdp(target_rtp.port());
+    let target_task = tokio::spawn(async move {
+        let mut bytes = vec![0u8;65536];
+        let (n,pbx) = tokio::time::timeout(Duration::from_secs(3),target.recv_from(&mut bytes)).await.unwrap().unwrap();
+        let invite = String::from_utf8(bytes[..n].to_vec()).unwrap();
+        assert!(invite.starts_with("INVITE "));
+        target.send_to(transfer_peer_response(&invite,"180 Ringing",address,"").as_bytes(),pbx).await.unwrap();
+        let until = Instant::now()+Duration::from_secs(5);
+        let mut cancelled = false;
+        let mut acked = false;
+        while Instant::now()<until {
+            let (n,from) = tokio::time::timeout(Duration::from_secs(2),target.recv_from(&mut bytes)).await.unwrap().unwrap();
+            let request = String::from_utf8(bytes[..n].to_vec()).unwrap();
+            if request.starts_with("CANCEL ") {
+                cancelled = true;
+                target.send_to(transfer_peer_response(&request,"200 OK",address,"").as_bytes(),from).await.unwrap();
+                target.send_to(transfer_peer_response(&invite,"200 OK",address,&sdp).as_bytes(),pbx).await.unwrap();
+            } else if request.starts_with("ACK ") { acked=true; }
+            else if request.starts_with("BYE ") {
+                target.send_to(transfer_peer_response(&request,"200 OK",address,"").as_bytes(),from).await.unwrap();
+                assert!(cancelled && acked, "late 200 must be ACKed and BYE'd after CANCEL");
+                return;
+            }
+        }
+        panic!("late answered target was not cleaned up");
+    });
+    let xfer=ctl.command("transfer",1,json!({"call_id":"call-x-late","payload":{
+        "target":format!("sip:latepeer@{address}"),"transfer_timeout_ms":500}})).await;
+    assert_eq!(xfer["type"],"command_ack","{xfer}");
+    tokio::time::timeout(Duration::from_secs(6),target_task).await.unwrap().unwrap();
+    let before=rtp.tone_frames(AGENT_TONE_HZ).len();
+    send_agent_audio(&mut media,12,AGENT_TONE_HZ,50).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(rtp.tone_frames(AGENT_TONE_HZ).len()>=before+40,"original agent media remains selected");
+    let snapshot=ctl.command("get_call",1,json!({"call_id":"call-x-late","payload":{}})).await;
+    assert_eq!(snapshot["active_calls"][0]["state"],"transferring");
+    assert!(!ctl.events.iter().any(|e|e["type"]=="transfer_completed" || (e["type"]=="command_error" && e["command_id"]==xfer["command_id"])));
+    ctl.command("hangup",1,json!({"call_id":"call-x-late","payload":{"reason":"test_uncertain_cleanup"}})).await;
+    assert!(wait_for_ua_event(&alice,Duration::from_secs(3),|e|matches!(e,TestUaEvent::CallTerminated(_))).await.is_some());
+    rtp.cancel.cancel(); target_rtp.cancel.cancel(); h.server.stop();
+}
+
+/// vbox's per-target ring limit (`max_ring_secs`) replaces the former 4 s
+/// cap: a real phone answering after 6 s within a 10 s limit is bridged.
+#[tokio::test]
+async fn vbox_contract_transfer_target_answering_after_6s_is_bridged() {
+    let mut h = harness(30).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {}})).await;
+    let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+    let bob = h.server.create_ua("bob").await.unwrap();
+    let rtp = CallerRtp::bind().await;
+    let bob_rtp = CallerRtp::bind().await;
+    let (pbx_call_id, _, pbx_rtp, _media) =
+        establish_inbound(&mut h, &mut ctl, &alice, &rtp, 1, "call-x-slow", "m-slow").await;
+    rtp.send_tone(pbx_rtp, CALLER_TONE_HZ, 20);
+    let target = format!("sip:bob@127.0.0.1:{}", bob.local_port());
+    let xfer = ctl.command("transfer", 1, json!({"call_id":"call-x-slow", "payload":{
+        "pbx_call_id":pbx_call_id,"target":target,"max_ring_secs":10}})).await;
+    assert_eq!(xfer["type"], "command_ack", "{xfer}");
+    let incoming = wait_for_ua_event(&bob, Duration::from_secs(3), |e| matches!(e,TestUaEvent::IncomingCall(..))).await;
+    let Some(TestUaEvent::IncomingCall(dialog, offer)) = incoming else { panic!("target not invited") };
+    let invited = Instant::now();
+    bob.send_ringing(&dialog, None).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Buffer whatever the PBX reported while the target rang: neither a
+    // failure nor a premature `transfer_completed`.
+    assert!(!ctl.closed_within(Duration::from_millis(300)).await);
+    assert!(
+        !ctl.events.iter().any(|e| e["type"] == "command_error" || e["type"] == "transfer_completed"),
+        "transfer settled before the target answered: {:?}", ctl.events
+    );
+    bob.answer_call(&dialog, Some(make_sdp(bob_rtp.port()))).await.expect("target answers after 6 s");
+    let bob_pbx_rtp = extract_media_endpoint(offer.as_deref().expect("offer")).expect("offer address");
+    bob_rtp.send_tone(bob_pbx_rtp, AGENT_TONE_HZ, 10);
+    let done = ctl.event("transfer_completed", Duration::from_secs(5)).await;
+    assert_eq!(done["command_id"], xfer["command_id"]);
+    assert!(invited.elapsed() >= Duration::from_secs(6));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(bob_rtp.tone_frames(CALLER_TONE_HZ).len() >= 20, "caller reaches the late-answering target");
+    rtp.cancel.cancel(); bob_rtp.cancel.cancel(); h.server.stop();
+}
+
+/// A transfer target that the route table resolves to an application on the
+/// caller's own session (here the vbox DID itself, `app = "rwi"`) bridges no
+/// leg: RustPBX must refuse it as `transfer_failed` and keep the caller with
+/// the attached agent. Live 2026-10-19 it restarted the rwi app, closed the
+/// agent's media "transferred" and reported `transfer_completed`; the caller
+/// sat in silence.
+#[tokio::test]
+async fn vbox_contract_transfer_to_application_route_fails_and_keeps_agent() {
+    let mut h = harness(30).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {}})).await;
+    let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+    let rtp = CallerRtp::bind().await;
+    let (pbx_call_id, _, pbx_rtp, mut media) =
+        establish_inbound(&mut h, &mut ctl, &alice, &rtp, 1, "call-x-app", "m-app").await;
+    rtp.send_tone(pbx_rtp, CALLER_TONE_HZ, 20);
+    let xfer = ctl.command("transfer", 1, json!({"call_id":"call-x-app", "payload":{
+        "pbx_call_id":pbx_call_id,"target":VBOX_DID,"max_ring_secs":10}})).await;
+    assert_eq!(xfer["type"], "command_ack", "{xfer}");
+    let failed = ctl.event("command_error", Duration::from_secs(5)).await;
+    assert_eq!(failed["command_id"], xfer["command_id"], "{failed}");
+    assert_eq!(failed["error_code"], "transfer_failed");
+    assert_eq!(failed["reason"], "target_resolved_to_application", "{failed}");
+    assert!(!ctl.events.iter().any(|e| e["type"] == "transfer_completed"), "{:?}", ctl.events);
+    // The agent's media stays attached and still reaches the caller.
+    let until = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < until {
+        if let Ok(Some(Ok(Message::Close(f)))) = tokio::time::timeout(Duration::from_millis(100), media.next()).await {
+            panic!("agent media closed after a refused transfer: {f:?}");
+        }
+    }
+    let before = rtp.tone_frames(AGENT_TONE_HZ).len();
+    send_agent_audio(&mut media, 21, AGENT_TONE_HZ, 50).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(rtp.tone_frames(AGENT_TONE_HZ).len() >= before + 40, "agent audio still reaches the caller");
+    let snap = ctl.command("get_call", 1, json!({"call_id":"call-x-app","payload":{}})).await;
+    assert_eq!(snap["active_calls"][0]["state"], "answered", "{snap}");
+    ctl.command("hangup",1,json!({"call_id":"call-x-app","payload":{"reason":"test_cleanup"}})).await;
+    assert!(wait_for_ua_event(&alice, Duration::from_secs(3), |e| matches!(e,TestUaEvent::CallTerminated(_))).await.is_some());
+    rtp.cancel.cancel(); h.server.stop();
+}
+
+/// A target still ringing past the payload's `max_ring_secs` is cancelled
+/// and the transfer fails authoritatively at that limit, not at a default.
+#[tokio::test]
+async fn vbox_contract_transfer_fails_at_payload_ring_limit() {
+    let mut h = harness(30).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {}})).await;
+    let alice = Arc::new(h.server.create_ua("alice").await.unwrap());
+    let bob = h.server.create_ua("bob").await.unwrap();
+    let rtp = CallerRtp::bind().await;
+    let (pbx_call_id, _, _, _media) =
+        establish_inbound(&mut h, &mut ctl, &alice, &rtp, 1, "call-x-limit", "m-limit").await;
+    let target = format!("sip:bob@127.0.0.1:{}", bob.local_port());
+    let started = Instant::now();
+    let xfer = ctl.command("transfer", 1, json!({"call_id":"call-x-limit", "payload":{
+        "pbx_call_id":pbx_call_id,"target":target,"max_ring_secs":2}})).await;
+    assert_eq!(xfer["type"], "command_ack", "{xfer}");
+    let incoming = wait_for_ua_event(&bob, Duration::from_secs(3), |e| matches!(e,TestUaEvent::IncomingCall(..))).await;
+    let Some(TestUaEvent::IncomingCall(dialog, _)) = incoming else { panic!("target not invited") };
+    bob.send_ringing(&dialog, None).await.unwrap();
+    let failed = ctl.event("command_error", Duration::from_secs(5)).await;
+    let after = started.elapsed();
+    assert_eq!(failed["error_code"], "transfer_failed");
+    assert_eq!(failed["command_id"], xfer["command_id"]);
+    assert!(after >= Duration::from_millis(1900) && after < Duration::from_millis(3500), "failed after {after:?}, limit 2 s");
+    assert!(wait_for_ua_event(&bob, Duration::from_secs(2), |e| matches!(e,TestUaEvent::CallTerminated(_))).await.is_some(), "target cancelled");
+    ctl.command("hangup",1,json!({"call_id":"call-x-limit","payload":{"reason":"test_cleanup"}})).await;
+    rtp.cancel.cancel(); h.server.stop();
+}
+
+/// The actual UAS must preserve the requested 503, not generic hangup's 487.
+#[tokio::test]
+async fn vbox_contract_disconnected_controller_rejects_new_invite_with_503() {
+    let h = harness(1).await;
+    let mut ctl = Controller::connect(&h.rwi_url).await;
+    ctl.command("list_owned_calls", 1, json!({"payload": {}})).await;
+    drop(ctl);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.gateway.read().vbox.accepting_inbound() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("actual controller disconnect");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let alice = h.server.create_ua("alice").await.unwrap();
+    let rtp = CallerRtp::bind().await;
+    let outcome = tokio::time::timeout(Duration::from_secs(3),
+        alice.make_call(VBOX_DID, Some(make_sdp(rtp.port())))).await.unwrap();
+    let error = outcome.expect_err("controllerless INVITE must fail").to_string();
+    assert_eq!(error, "Call failed: 503 Service Unavailable");
+    rtp.cancel.cancel();
+    alice.stop();
+    drop(h);
 }

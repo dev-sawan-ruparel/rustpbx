@@ -10,7 +10,7 @@ use super::session::SipSession;
 use crate::call::domain::{CallCommand, HangupCascade, HangupCommand, HangupInitiator, LegId};
 use crate::call::vbox_media::{
     CloseRequest, MediaIo, MediaLimits, MediaOutput, Playout, SAMPLE_RATE, SAMPLES_PER_20MS,
-    SharedPlayout, VboxMediaStart, VboxPlayoutSource, run_media_session, MAX_MEDIA_MESSAGE_BYTES,
+    SharedPlayout, VboxMediaStart, VboxPlayoutSource, run_media_session, MAX_MEDIA_MESSAGE_BYTES, MEDIA_CONTROL_CAPACITY,
 };
 use crate::proxy::proxy_call::media_state::{ExternalBridgeHandle, ExternalBridgeKind};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 impl SipSession {
-    fn vbox_control(&self) -> Option<Arc<crate::rwi::vbox::VboxControl>> {
+    pub(super) fn vbox_control(&self) -> Option<Arc<crate::rwi::vbox::VboxControl>> {
         self.server
             .rwi_gateway
             .as_ref()
@@ -68,13 +68,26 @@ impl SipSession {
         // without touching its successor.
         let cancel = self.cancel_token.child_token();
         let playout: SharedPlayout = Arc::new(parking_lot::Mutex::new(Playout::new(start.max_buffer_ms)));
-        let (playout_events_tx, playout_events) = mpsc::unbounded_channel();
-        leg.play(
-            Box::new(VboxPlayoutSource::new(playout.clone(), playout_events_tx)),
+        let (playout_events_tx, playout_events) = mpsc::channel(MEDIA_CONTROL_CAPACITY);
+        let audio_sender = leg.pc().get_transceivers().into_iter()
+            .find(|t| t.kind() == rustrtc::MediaKind::Audio).and_then(|t| t.sender())
+            .ok_or_else(|| anyhow::anyhow!("vbox media: missing audio RTP sender"))?;
+        let receipt_observer: Arc<dyn rustrtc::peer_connection::RtpObserver> = Arc::new(crate::call::vbox_media::VboxTransmissionObserver {
+            playout: Arc::downgrade(&playout),
+            events: playout_events_tx.clone(),
+            cancel: cancel.clone(),
+            ssrc: audio_sender.ssrc(),
+            payload_type: audio_sender.params().payload_type,
+        });
+        leg.pc().add_observer(receipt_observer.clone());
+        if let Err(error) = leg.play(
+            Box::new(VboxPlayoutSource::new(playout.clone(), playout_events_tx, cancel.clone())),
             false,
             None,
-        )
-        .await?;
+        ).await {
+            leg.pc().remove_observer(&receipt_observer);
+            return Err(error);
+        }
 
         // ── Uplink: caller PCM → 16 kHz 20 ms frames. Never blocks RTP: a
         //    full uplink queue drops the frame. ────────────────────────────
@@ -113,9 +126,9 @@ impl SipSession {
         }
 
         // ── Caller DTMF (session-level, de-duplicated) ────────────────────
-        let (dtmf_json_tx, mut dtmf_json_rx) = mpsc::unbounded_channel::<String>();
-        let (caller_dtmf_tx, caller_dtmf) = mpsc::unbounded_channel::<String>();
-        *self.bridge_dtmf_tx.write() = Some(dtmf_json_tx);
+        let (dtmf_json_tx, mut dtmf_json_rx) = mpsc::channel::<String>(MEDIA_CONTROL_CAPACITY);
+        let (caller_dtmf_tx, caller_dtmf) = mpsc::channel::<String>(MEDIA_CONTROL_CAPACITY);
+        *self.bridge_dtmf_tx.write() = Some(super::util::BridgeDtmfSender::Vbox { sender: dtmf_json_tx, cancel: cancel.clone() });
         {
             let relay_cancel = cancel.clone();
             crate::utils::spawn(async move {
@@ -126,8 +139,9 @@ impl SipSession {
                     };
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json)
                         && let Some(d) = v.get("digit").and_then(|d| d.as_str())
-                        && caller_dtmf_tx.send(d.to_string()).is_err()
+                        && caller_dtmf_tx.try_send(d.to_string()).is_err()
                     {
+                        relay_cancel.cancel();
                         break;
                     }
                 }
@@ -135,7 +149,7 @@ impl SipSession {
         }
 
         let (close_tx, close_requests) = mpsc::channel::<CloseRequest>(4);
-        let (outputs_tx, mut outputs) = mpsc::unbounded_channel::<MediaOutput>();
+        let (outputs_tx, mut outputs) = mpsc::channel::<MediaOutput>(MEDIA_CONTROL_CAPACITY + 1);
         control.media_attached(&start.pbx_call_id, &start.media_session_id, close_tx);
 
         let io = MediaIo {
@@ -147,7 +161,12 @@ impl SipSession {
             outputs: outputs_tx,
             cancel: cancel.clone(),
         };
-        crate::utils::spawn(run_media_session(ws, start.attachment(), io, MediaLimits::default()));
+        let receipt_pc = leg.pc().clone();
+        let attachment = start.attachment();
+        crate::utils::spawn(async move {
+            run_media_session(ws, attachment, io, MediaLimits::default()).await;
+            receipt_pc.remove_observer(&receipt_observer);
+        });
 
         // ── Outcomes back into the session loop ───────────────────────────
         {
@@ -218,8 +237,13 @@ impl SipSession {
                 let _ = leg.stop_playback().await;
             }
         }
-        if let MediaOutput::AgentHangup { reason } = outcome {
-            control.set_terminal_reason(&pbx_call_id, "agent_hangup_ws_4000");
+        if current && let MediaOutput::AgentHangup { reason } = outcome {
+            let terminal_reason = if reason == "server_drain_timeout" {
+                "server_drain_timeout"
+            } else {
+                "agent_hangup_ws_4000"
+            };
+            control.set_terminal_reason(&pbx_call_id, terminal_reason);
             self.handle_hangup(&HangupCommand {
                 leg_id: None,
                 cascade: HangupCascade::All,

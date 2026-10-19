@@ -26,6 +26,9 @@ fn path_without_query(file_path: &str) -> String {
 
 pub trait AudioSource: Send + Sync {
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize;
+    /// Register a frame before it enters the RTP sender; failure means it was dropped.
+    fn prepare_rtp(&mut self, _timestamp: u32) {}
+    fn rtp_enqueue_failed(&mut self) {}
     fn sample_rate(&self) -> u32;
     fn channels(&self) -> u16;
     fn has_data(&self) -> bool;
@@ -635,6 +638,8 @@ impl ResamplingAudioSource {
 }
 
 impl AudioSource for ResamplingAudioSource {
+    fn prepare_rtp(&mut self, timestamp: u32) { self.source.prepare_rtp(timestamp); }
+    fn rtp_enqueue_failed(&mut self) { self.source.rtp_enqueue_failed(); }
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
         if let Some(ref mut resampler) = self.resampler {
             let needed_source = (buffer.len() as u64 * self.source_sample_rate as u64)

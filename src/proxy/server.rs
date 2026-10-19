@@ -160,6 +160,18 @@ pub struct SipServerInner {
     pub rwi_webhook_config: ArcSwap<Option<crate::config::LocatorWebhookConfig>>,
 }
 
+/// Restores shared transaction accounting on success, cancellation and unwind.
+struct RunningTransactionGuard(Arc<AtomicUsize>);
+impl RunningTransactionGuard {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+impl Drop for RunningTransactionGuard {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
+}
+
 fn random_hex() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
@@ -923,6 +935,9 @@ impl SipServerBuilder {
         if self.config.nat_fix {
             inspectors.insert(0, Box::new(super::nat::NatInspector::new()));
         }
+        inspectors.push(Box::new(super::via_transport::ViaTransportInspector::new(
+            endpoint_local_addrs.clone(),
+        )));
         inspectors.push(Box::new(
             super::capability_headers::CapabilityHeadersInspector::new(advertised_methods.clone()),
         ));
@@ -1651,7 +1666,7 @@ impl SipServer {
                 }
             }
             crate::utils::spawn(async move {
-                runnings_tx.fetch_add(1, Ordering::Relaxed);
+                let _running_guard = RunningTransactionGuard::enter(runnings_tx);
                 let start_time = Instant::now();
                 let cookie = TransactionCookie::from(&tx.key);
                 let guard = token.clone().drop_guard();
@@ -1673,7 +1688,6 @@ impl SipServer {
                 };
                 crate::metrics::transaction::latency_seconds(start_time.elapsed().as_secs_f64());
                 crate::sip_telemetry::SipTelemetry::record_tx_latency(start_time.elapsed());
-                runnings_tx.fetch_sub(1, Ordering::Relaxed);
                 let is_mid_dialog = tx
                     .original
                     .to_header()
