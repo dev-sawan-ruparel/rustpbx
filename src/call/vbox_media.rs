@@ -200,7 +200,13 @@ pub struct Playout {
     playback_stopped: CancellationToken,
     read_marks: Vec<Mark>,
     in_flight: VecDeque<(u32, std::time::Instant, Vec<Mark>)>,
+    /// Failed local RTP writes in a row; see `transmitted`.
+    send_failures: u32,
+    pub lost_frames: u64,
 }
+
+/// Failed RTP writes in a row (20 ms each) before the attachment closes.
+const MAX_CONSECUTIVE_SEND_FAILURES: u32 = 50;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -227,6 +233,8 @@ impl Playout {
             playback_stopped: CancellationToken::new(),
             read_marks: Vec::new(),
             in_flight: VecDeque::new(),
+            send_failures: 0,
+            lost_frames: 0,
         }
     }
 
@@ -236,6 +244,13 @@ impl Playout {
 
     pub fn buffered_ms(&self) -> u64 {
         samples_to_ms(self.queued_samples)
+    }
+
+    /// Forget every mark not yet confirmed: in flight, read, and queued.
+    fn drop_pending_marks(&mut self) {
+        self.read_marks.clear();
+        for (_, _, marks) in self.in_flight.iter_mut() { marks.clear(); }
+        self.queue.retain(|item| !matches!(item, Item::Mark(_)));
     }
 
     pub fn close(&mut self) {
@@ -423,7 +438,24 @@ impl Playout {
         if self.closed { return; }
         let Some(index) = self.in_flight.iter().position(|(ts, _, _)| *ts == timestamp) else { return; };
         // The normal sender is serial. Missing/reordered receipts cannot prove the prefix.
-        if !sent || index != 0 { self.close(); return; }
+        if index != 0 { self.close(); return; }
+        if !sent {
+            // A failed local write is a lost frame, like loss on the wire,
+            // not the end of the call. 2026-11-06 (loopback, twice): the
+            // first RTP packet of two legs starting at once in one network
+            // namespace was dropped by conntrack (EPERM), and closing here
+            // hung up the call. The lost audio still never confirms: every
+            // mark pending now is dropped (I5 fails closed on vbox's
+            // mark_ack_timeout_ms); marks pushed later confirm as usual.
+            // A transport that keeps failing still closes the attachment.
+            self.lost_frames += 1;
+            self.send_failures += 1;
+            if self.send_failures >= MAX_CONSECUTIVE_SEND_FAILURES { self.close(); return; }
+            self.in_flight.pop_front();
+            self.drop_pending_marks();
+            return;
+        }
+        self.send_failures = 0;
         let (_, _, marks) = self.in_flight.pop_front().unwrap();
         for mark in marks {
             if mark.generation < self.active_generation { out.push(MediaEvent::MarkCleared { mark }); }
@@ -1092,7 +1124,20 @@ mod tests {
             let result = transport.send_rtp(packet).await;
             if mode == 1 {
                 assert!(result.is_err(), "SRTP without keys fails actual transport");
-                assert!(cancel.is_cancelled());
+                // one failed write is a lost frame: its mark never confirms
+                // and the attachment keeps going ...
+                assert!(!cancel.is_cancelled());
+                assert!(rx.try_recv().is_err());
+                // ... until the transport keeps failing
+                for n in 2..=MAX_CONSECUTIVE_SEND_FAILURES {
+                    let ts = 160 * n;
+                    playout.lock().push_pcm(1, tone(4, 320), &mut out);
+                    source.read_samples(&mut [0; 320]);
+                    source.prepare_rtp(ts);
+                    let packet = rustrtc::rtp::RtpPacket::new(rustrtc::rtp::RtpHeader::new(0, n as u16, ts, 42), vec![9;160]);
+                    assert!(transport.send_rtp(packet).await.is_err());
+                }
+                assert!(cancel.is_cancelled(), "{} failed writes in a row close", MAX_CONSECUTIVE_SEND_FAILURES);
                 assert!(rx.try_recv().is_err());
             } else {
                 assert!(result.unwrap() > 0);
@@ -1169,9 +1214,69 @@ mod tests {
                 _ => { p.prepare_rtp(200); p.transmitted(200, true, &mut out); }
             }
             p.transmitted(100, true, &mut out);
-            assert!(p.is_closed());
+            // a failed write is a lost frame (lost_frame_never_confirms...);
+            // a missing or reordered receipt still closes
+            assert_eq!(p.is_closed(), mode != 0, "mode {mode}");
             assert!(!out.iter().any(|e| matches!(e, MediaEvent::MarkPlayed { .. })));
         }
+    }
+
+    #[test]
+    fn lost_frame_never_confirms_its_marks_and_the_attachment_keeps_playing() {
+        // 2026-11-06 loopback: one EPERM on the first RTP packet closed the
+        // attachment and hung up the call
+        let mut p = Playout::new(10_000);
+        let mut out = Vec::new();
+        p.push_pcm(1, tone(4, 640), &mut out);
+        p.push_mark(mark("before", 1), &mut out);
+        p.push_pcm(1, tone(5, 320), &mut out);
+        p.push_mark(mark("queued", 1), &mut out);
+        let mut buf = vec![0i16; 320];
+        p.read(&mut buf, &mut out);
+        p.prepare_rtp(100);
+        p.transmitted(100, false, &mut out);
+        assert!(!p.is_closed());
+        assert_eq!(p.lost_frames, 1);
+        for ts in [200, 300, 400, 500] {
+            p.read(&mut buf, &mut out);
+            p.prepare_rtp(ts);
+            p.transmitted(ts, true, &mut out);
+        }
+        assert!(!out.iter().any(|e| matches!(e, MediaEvent::MarkPlayed { .. })),
+                "audio behind a lost frame never confirms: {out:?}");
+        // a mark pushed after the loss confirms as usual
+        out.clear();
+        p.push_pcm(2, tone(6, 320), &mut out);
+        p.push_mark(mark("after", 2), &mut out);
+        for ts in [600, 700, 800] {
+            p.read(&mut buf, &mut out);
+            p.prepare_rtp(ts);
+            p.transmitted(ts, true, &mut out);
+        }
+        assert!(out.iter().any(|e| matches!(e, MediaEvent::MarkPlayed { mark: m, .. } if m.mark_id == "after")),
+                "{out:?}");
+    }
+
+    #[test]
+    fn a_transport_that_keeps_failing_closes_the_attachment() {
+        let mut p = Playout::new(10_000);
+        let mut out = Vec::new();
+        let mut buf = vec![0i16; 320];
+        for n in 0..MAX_CONSECUTIVE_SEND_FAILURES {
+            assert!(!p.is_closed(), "closed after {n} failures");
+            p.push_pcm(1, tone(4, 320), &mut out);
+            p.read(&mut buf, &mut out);
+            p.prepare_rtp(100 + n);
+            p.transmitted(100 + n, n % 10 == 9 && n < 20, &mut out);  // two successes early reset the count
+        }
+        assert!(!p.is_closed());
+        for n in 0..20 {
+            p.push_pcm(1, tone(4, 320), &mut out);
+            p.read(&mut buf, &mut out);
+            p.prepare_rtp(1000 + n);
+            p.transmitted(1000 + n, false, &mut out);
+        }
+        assert!(p.is_closed());
     }
 
     #[test]
